@@ -1,0 +1,9 @@
+services:
+  preprocessor:
+    build:
+      context: .
+      dockerfile: tiling/Dockerfile
+    volumes:
+      - ./sample:/sample
+      - ./out:/out
+    entrypoint: ["python", "tile.py"]

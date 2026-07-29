@@ -220,3 +220,5 @@ __marimo__/
 # Custom
 gdc-client
 *.log
+sample/
+out/
