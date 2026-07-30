@@ -14,6 +14,8 @@ services:
             - driver: nvidia
               device_ids: ['${CUDA_VISIBLE_DEVICES}']
               capabilities: [gpu]
+    environment:
+      - PYTHONUNBUFFERED=1
     command: >
       tritonserver
       --model-repository=/models
@@ -28,13 +30,17 @@ services:
       - ./out:/out
     ports:
       - 8080:8080
+    environment:
+      - PYTHONUNBUFFERED=1
     # entrypoint is python main.py
     # TODO: tune batch size, concurrent calls, tile readers, queue depth
     command: >
       --model_name virchow
       --predictor_host triton:8001
       --protocol=v2
-      --tile_batch 32
+      --tile_batch 512
       --concurrent_calls_to_predictor 8
       --num_tile_readers 4
       --queue_depth 16
+    depends_on:
+      - triton

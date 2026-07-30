@@ -64,7 +64,7 @@ class WSITransformer(Model):
         # KServe unwraps the event and so handle S3 notification body instead
         # For demo, assume input comes preloaded in container
         slide_path = payload["slide_uri"]
-        print(f"HERE: {slide_path}")
+
         return {"slide_path": slide_path, "slide_uri": payload["slide_uri"]}
 
     # ---------- 2. tile + fan out ------------------------------------------
@@ -103,7 +103,7 @@ class WSITransformer(Model):
                 img_format="numpy",
                 lazy_iter=True,  # keep memory usage down
                 pool=POOL,  # use prebuilt pool
-                show_progress=True,  # TODO: disable for prod
+                show_progress=False,
             )
             batch_tiles, batch_coords, start = [], [], 0
             assert gen is not None
@@ -150,6 +150,7 @@ class WSITransformer(Model):
                 emb = resp.outputs[0].as_numpy()
                 out[start : start + len(emb)] = emb
                 coords[start : start + len(batch_coords)] = batch_coords
+                print(f"consumed batch starting from idx {start} (n_max={n_max})")
 
         await asyncio.gather(
             loop.run_in_executor(None, produce),
