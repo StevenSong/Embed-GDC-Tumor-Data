@@ -18,8 +18,9 @@ logger = logging.getLogger(__name__)
 TILE_PX = 224
 TILE_UM = 112  # Virchow works at 20x i.e. 0.5 MPP
 EMBED_DIM = 2560
-INPUT_NAME = "input"  # must match Triton config.pbtxt
-OUTPUT_NAME = "output"
+# must match Triton config.pbtxt; libtorch requires the INPUT__<idx> convention
+INPUT_NAME = "INPUT__0"
+OUTPUT_NAME = "OUTPUT__0"
 GRPC_MAX_MSG = 128 * 1024 * 1024
 
 _CTX = mp.get_context("forkserver")
@@ -63,7 +64,7 @@ class WSITransformer(Model):
         # KServe unwraps the event and so handle S3 notification body instead
         # For demo, assume input comes preloaded in container
         slide_path = payload["slide_uri"]
-
+        print(f"HERE: {slide_path}")
         return {"slide_path": slide_path, "slide_uri": payload["slide_uri"]}
 
     # ---------- 2. tile + fan out ------------------------------------------
@@ -87,7 +88,7 @@ class WSITransformer(Model):
         # so keep track of how many tiles were actually written
         n_max = len(wsi.get_tile_dataframe())
         out = np.empty((n_max, EMBED_DIM), dtype=np.float32)
-        coords = np.empty((n_max, 2), dtype=np.int32) * -1
+        coords = np.empty((n_max, 2), dtype=np.int32)
         written = 0
 
         q = asyncio.Queue(maxsize=self.queue_depth)
@@ -186,13 +187,9 @@ class WSITransformer(Model):
 
     @staticmethod
     def _write_h5(path, result, meta):
-        # CLAM-compatible layout: downstream MIL code reads it unmodified.
         with h5py.File(path, "w") as f:
             f.create_dataset("features", data=result["features"], compression="gzip")
-            d = f.create_dataset("coords", data=result["coords"])
-            d.attrs["patch_size"] = TILE_PX
-            d.attrs["level"] = meta["level"]
-            d.attrs["mpp"] = meta["mpp"]
+            f.create_dataset("coords", data=result["coords"])
 
 
 parser = argparse.ArgumentParser(parents=[model_server.parser])
@@ -200,7 +197,6 @@ parser.add_argument("--tile_batch", type=int, default=32)
 parser.add_argument("--concurrent_calls_to_predictor", type=int, default=8)
 parser.add_argument("--num_tile_readers", type=int, default=8)
 parser.add_argument("--queue_depth", type=int, default=16)
-parser.add_argument
 args, _ = parser.parse_known_args()
 
 if __name__ == "__main__":

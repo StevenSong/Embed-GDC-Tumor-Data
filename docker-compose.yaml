@@ -14,11 +14,11 @@ services:
             - driver: nvidia
               device_ids: ['${CUDA_VISIBLE_DEVICES}']
               capabilities: [gpu]
-    command:
-      - tritonserver
-      - --model-repository=/models
-      - --grpc-port=8001
-      - --http-port=8000
+    command: >
+      tritonserver
+      --model-repository=/models
+      --grpc-port=8001
+      --http-port=8000
   preprocessor:
     build:
       context: preprocessor/
@@ -28,11 +28,13 @@ services:
       - ./out:/out
     ports:
       - 8080:8080
-    command: # entrypoint is already python main.py
-      - --model_name virchow
-      - --predictor_host triton:8001
-      - --protocol=v2
-      - --tile_batch 32 # tune me!
-      - --concurrent_calls_to_predictor 8 # tune me!
-      - --num_tile_readers 4 # tune me!
-      - --queue_depth 16 # tune me!
+    # entrypoint is python main.py
+    # TODO: tune batch size, concurrent calls, tile readers, queue depth
+    command: >
+      --model_name virchow
+      --predictor_host triton:8001
+      --protocol=v2
+      --tile_batch 32
+      --concurrent_calls_to_predictor 8
+      --num_tile_readers 4
+      --queue_depth 16
