@@ -19,9 +19,9 @@ def main(
 ):
     wsi = sf.WSI(
         input_svs,
-        tile_px=256,  # output tile size in pixels
-        tile_um=128,  # physical size in microns (~20x for 256px).
-        stride_div=1,  # 1 = no overlap, 2 = 50% overlap
+        tile_px=224,  # input size for Virchow, tile directly to size rather than resize in transform
+        tile_um=112,  # assuming 20x is 0.5um per pixel, then whole tile is 112 um
+        stride_div=1,  # no overlap
         enable_downsample=True,
         roi_method="ignore",  # no ROIs; extract across the whole slide
     )

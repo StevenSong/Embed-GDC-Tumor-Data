@@ -222,3 +222,4 @@ gdc-client
 *.log
 sample/
 out/
+*.pt

@@ -5,6 +5,7 @@ h5tree
 ipywidgets
 isort
 jupyterlab
+kserve==0.19.0
 numpy
 pandas
 pqdm
@@ -12,10 +13,13 @@ pre-commit
 scikit-learn
 scipy
 seaborn
+slideflow
 statannotations
 statsmodels
 tableone
+timm
 torch
+torchvision
 tqdm
 transformers
 omegaconf
