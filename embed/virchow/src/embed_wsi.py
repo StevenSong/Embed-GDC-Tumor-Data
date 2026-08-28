@@ -551,7 +551,7 @@ class MarkupFormatter(logging.Formatter):
 
 def setup_logging():
     handler = RichHandler(
-        console=Console(file=TqdmStream()),
+        console=Console(file=TqdmStream()),  # type: ignore
         markup=True,
         highlighter=NullHighlighter(),
         show_path=False,
