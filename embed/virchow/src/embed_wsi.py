@@ -64,8 +64,11 @@ _CTX = mp.get_context("forkserver")
 # queue flags between the reader thread and the inference loop
 _BATCH, _DONE, _ERROR = "batch", "done", "error"
 
-# how long to let a reader parked in q.put() finish once its pool is terminated
-READER_DRAIN_TIMEOUT_S = 2
+# draining a failed slide's reader: stop once it has gone quiet for this many
+# polls, with the total elapsed as a hard backstop
+READER_DRAIN_POLL_S = 0.1
+READER_DRAIN_QUIET_POLLS = 3
+READER_DRAIN_TIMEOUT_S = 30
 
 
 class TqdmLoggingHandler(logging.Handler):
@@ -407,15 +410,23 @@ def embed_slide(
         # kill the workers: a dead pool produces no more tiles, so it can neither
         # starve the next slide nor buffer the rest of this one in memory
         pool.terminate()
-        # then let a reader parked in q.put() drain its way to the return. one
-        # already inside imap.next() will not wake -- terminate() never notifies
-        # pending results -- but with the pool dead it is a bounded daemon thread
+        # then drain what the reader still holds. the thread itself cannot be
+        # reclaimed -- one parked in imap.next() is unreachable, terminate() never
+        # notifies pending results -- but draining releases the batches it
+        # references, roughly halving what a failed slide leaves behind. with the
+        # pool dead it stops producing quickly, so the timeout is only a backstop
         deadline = time.time() + READER_DRAIN_TIMEOUT_S
-        while reader.is_alive() and time.time() < deadline:
+        quiet = 0
+        while (
+            reader.is_alive()
+            and quiet < READER_DRAIN_QUIET_POLLS
+            and time.time() < deadline
+        ):
             try:
-                q.get(timeout=0.1)
+                q.get(timeout=READER_DRAIN_POLL_S)
+                quiet = 0
             except queue.Empty:
-                pass
+                quiet += 1
         if reader.is_alive():
             logger.warning("tile reader for %s left behind", slide_path.name)
         pool.join()
