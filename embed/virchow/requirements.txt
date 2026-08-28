@@ -1,0 +1,15 @@
+# Direct dependencies of embed_wsi.py and the model wrapper.
+#
+# torch is pinned because the CUDA build matters and the default PyPI wheels are
+# built against CUDA 13.0. For a different CUDA build, install torch/torchvision
+# from https://download.pytorch.org/whl/cuXXX before this file is installed.
+#
+# timm is deliberately unpinned: pip picks a version that agrees with the torch pin
+# and pulls timm's own deps (pyyaml, huggingface_hub, safetensors) along with it.
+#
+# numpy and pillow are used here too, but come from requirements-slideflow.txt.
+
+h5py                    # per-slide HDF5 output
+timm                    # Virchow is a timm model: hf-hub:paige-ai/Virchow
+torch==2.13.0
+torchvision==0.28.0

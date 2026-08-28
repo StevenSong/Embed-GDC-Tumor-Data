@@ -1,0 +1,37 @@
+# Minimal dependency set for slideflow's WSI tiling path, installed alongside
+# `pip install --no-deps slideflow` -- see the Dockerfile for why.
+#
+# Derived from slideflow 3.0.2's source, not from a build: the eager-import closure
+# of `import slideflow`, plus pyvips, which slideflow reaches only lazily through its
+# sf.slide_backend() dispatch. Re-derive this list when bumping slideflow.
+#
+# slideflow's own metadata declares ~35 packages. Left out here, because nothing on
+# the tiling path imports them: smac + ConfigSpace (-> pyrfr, needs swig to build on
+# py>3.10), imgui/pyopengl/glfw (GUI), umap-learn, tensorboard, saliency, gdown,
+# pretrainedmodels, parameterized, pyarrow, imageio, zarr, gast, triangle (lazy,
+# util.create_triangles), crc32c (lazy, tfrecord writing), seaborn (lazy, report
+# plots). Add them back if this image ever does more than tile and embed.
+#
+# torch and torchvision are also slideflow imports under SF_BACKEND=torch; they are
+# pinned in requirements.txt, which is installed first.
+
+fpdf2                   # fpdf; slide/report.py
+joblib                  # norm/vahadane.py
+matplotlib              # util/__init__.py, and mpl_toolkits via heatmap.py
+numpy
+opencv-python-headless  # cv2
+packaging               # util/__init__.py, slide/wsi.py
+pandas
+pillow                  # PIL
+protobuf                # google.protobuf; util/example_pb2
+pyvips                  # slide/backends/vips.py; lazy, on first slide read
+rasterio                # slide/wsi.py and slide/qc/otsu.py -- the tiling path itself
+requests                # util/__init__.py
+rich
+scikit-image            # skimage
+scikit-learn            # sklearn; stats/
+scipy
+setuptools              # pkg_resources in plugin.py; not bundled with py3.12
+shapely
+tabulate
+tqdm

@@ -12,46 +12,23 @@ RUN apt-get update \
  && apt-get clean \
  && rm -rf /var/lib/apt/lists/*
 
-# cu130 wheels are the current default build; pinned so a rebuild later still gets
-# the stack this was written against. Installed first: it is the biggest layer and
-# the one least likely to change, and nothing below is allowed to move it.
-ARG TORCH_VERSION=2.13.0
-ARG TORCHVISION_VERSION=0.28.0
-ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130
-RUN pip install --no-cache-dir \
-      torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} \
-      --index-url ${TORCH_INDEX_URL}
+WORKDIR /app
 
-# slideflow's dependency list is ~35 packages and mostly irrelevant to tiling: a
-# hyperparameter search stack (smac -> pyrfr, which needs swig to build on py>3.10),
-# a GUI (imgui/glfw/pyopengl), umap/numba, rasterio, tensorboard. Install it with
-# --no-deps and name only what the tiling path imports. timm gets the same treatment
-# so it cannot drag in a second copy of torch.
-RUN pip install --no-cache-dir --no-deps slideflow timm \
- && pip install --no-cache-dir \
-      click \
-      crc32c \
-      fpdf2 \
-      h5py \
-      huggingface_hub \
-      imageio \
-      matplotlib \
-      opencv-python-headless \
-      pandas \
-      pillow \
-      pyarrow \
-      pyvips \
-      pyyaml \
-      rich \
-      safetensors \
-      scikit-image \
-      scikit-learn \
-      scipy \
-      seaborn \
-      shapely \
-      tabulate \
-      tqdm \
-      zarr
+# torch, torchvision and timm, with torch pinned -- see requirements.txt. Installed
+# on its own layer and before everything else: it is by far the biggest download and
+# the least likely to change, so edits to the slideflow list below don't refetch it.
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir -r requirements.txt
+
+# slideflow's declared dependency list is ~35 packages and mostly irrelevant to
+# tiling: a hyperparameter search stack (smac -> pyrfr, which needs swig to build on
+# py>3.10), a GUI (imgui/glfw/pyopengl), umap/numba, tensorboard. Install it --no-deps
+# and name its real imports in requirements-slideflow.txt instead. That list is read
+# off slideflow's source, so the version is pinned here: bump the two together.
+ARG SLIDEFLOW_VERSION=3.0.2
+COPY requirements-slideflow.txt /app/
+RUN pip install --no-cache-dir --no-deps slideflow==${SLIDEFLOW_VERSION} \
+ && pip install --no-cache-dir -r requirements-slideflow.txt
 
 ENV PYTHONUNBUFFERED=1 \
     SF_SLIDE_BACKEND=libvips \
@@ -61,11 +38,11 @@ ENV PYTHONUNBUFFERED=1 \
 
 ENV HF_HOME=/opt/hf
 
-# --no-deps above means a missing transitive import shows up here, at build time,
-# rather than on the cluster: fail now and add the package to the list.
-RUN python -c "import slideflow as sf; import slideflow.util; import slideflow.slide.qc as qc; qc.Otsu(); print('slideflow', sf.__version__, 'ok')"
+# --no-deps above means a missing import shows up here, at build time, rather than on
+# the cluster: fail now and add the package to the list. The vips backend is imported
+# explicitly because slideflow only reaches it lazily, on the first slide read.
+RUN python -c "import slideflow as sf; import slideflow.util, slideflow.slide.backends.vips; import slideflow.slide.qc as qc; qc.Otsu(); print('slideflow', sf.__version__, 'ok')"
 
-WORKDIR /app
 COPY virchow.py download_model.py embed_wsi.py /app/
 
 # paige-ai/Virchow is gated, so the build needs a HF token with access to the repo.

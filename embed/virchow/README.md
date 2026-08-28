@@ -29,18 +29,36 @@ image history:
 HF_TOKEN=hf_xxx docker build --secret id=hf_token,env=HF_TOKEN -t virchow-embed embed/virchow
 ```
 
-The pinned stack is torch 2.13.0 / torchvision 0.28.0 on cu130 wheels; override with
-`--build-arg TORCH_VERSION=... --build-arg TORCHVISION_VERSION=... --build-arg TORCH_INDEX_URL=...`
-if the cluster needs a different CUDA build.
+The pinned stack is torch 2.13.0 / torchvision 0.28.0, in
+[`requirements.txt`](requirements.txt) — the default PyPI wheels are cu130 builds, so no separate
+index is needed. If the cluster needs a different CUDA build, install torch from
+`https://download.pytorch.org/whl/cuXXX` ahead of that file. timm is left unpinned so pip resolves
+it against the torch pin.
 
-slideflow and timm are installed with `--no-deps` and their runtime imports are listed explicitly.
+slideflow and timm are installed with `--no-deps`, with slideflow's imports listed explicitly.
 slideflow's own dependency list is ~35 packages, most of which tiling never touches — a
 hyperparameter search stack (`smac` -> `pyrfr`, which needs swig to build on py>3.10), a GUI
-(`imgui`/`glfw`/`pyopengl`), umap/numba, rasterio, tensorboard — and timm would otherwise pull a
-second copy of torch from PyPI. The cost of `--no-deps` is that a transitive import slideflow makes
-lazily could be missing; the build runs `import slideflow; qc.Otsu()` to catch that at build time
-rather than on the cluster, so if something is missing, add it to the list in the
-[`Dockerfile`](Dockerfile) and rebuild.
+(`imgui`/`glfw`/`pyopengl`), umap/numba, tensorboard — and timm would otherwise pull a second copy
+of torch from PyPI.
+
+[`requirements-slideflow.txt`](requirements-slideflow.txt) holds slideflow's set and nothing else:
+the eager-import closure of `import slideflow` read off slideflow 3.0.2's source, plus `pyvips`,
+which slideflow only reaches lazily through its `sf.slide_backend()` dispatch. It has not been
+verified by an actual build. Two entries are load-bearing and easy to mistake for cruft: `rasterio`
+is imported at module level by `slide/wsi.py` and `slide/qc/otsu.py`, and `setuptools` is needed
+because `slideflow.plugin` imports `pkg_resources`, which Python 3.12 no longer bundles.
+
+[`requirements.txt`](requirements.txt) is separate and small: `torch` (pinned), `torchvision`,
+`timm` and `h5py`, installed normally so pip resolves timm and pulls its own deps. Keeping the two
+files apart means a slideflow bump only touches the file derived from slideflow, and it keeps the
+big torch layer from being refetched when the slideflow list changes.
+
+To catch what the closure missed, the build runs an import check (`import slideflow`, the vips
+backend, and `qc.Otsu()`) before pulling the weights, so a missing package fails the build instead
+of the cluster run. If it does fail, add the package to the list in the [`Dockerfile`](Dockerfile).
+Known lazy imports deliberately left out: `seaborn` (report plots), `crc32c` (tfrecord writing),
+`triangle`, `umap-learn`, `smac` — pin them back in if you take this image beyond tiling. Bumping
+slideflow means re-deriving the list.
 
 ## Run
 
@@ -113,6 +131,8 @@ tinted, for eyeballing tissue detection across a cohort.
 ## Files
 
 * [`Dockerfile`](Dockerfile) — image, including the build-time weight pull
+* [`requirements-slideflow.txt`](requirements-slideflow.txt) — slideflow's minimal import set
+* [`requirements.txt`](requirements.txt) — torch (pinned), timm, and our own deps
 * [`virchow.py`](virchow.py) — the model wrapper (normalization + cls/patch-mean concat baked in)
 * [`download_model.py`](download_model.py) — build-time fetch and CPU smoke test
 * [`embed_wsi.py`](embed_wsi.py) — the CLI that walks a slide directory
