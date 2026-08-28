@@ -31,8 +31,16 @@ HF_TOKEN=hf_xxx docker build --secret id=hf_token,env=HF_TOKEN -t virchow-embed 
 
 The pinned stack is torch 2.13.0 / torchvision 0.28.0 on cu130 wheels; override with
 `--build-arg TORCH_VERSION=... --build-arg TORCHVISION_VERSION=... --build-arg TORCH_INDEX_URL=...`
-if the cluster needs a different CUDA build. slideflow is installed first and torch last, so
-slideflow's stale pins can't drag in a torch of their choosing.
+if the cluster needs a different CUDA build.
+
+slideflow and timm are installed with `--no-deps` and their runtime imports are listed explicitly.
+slideflow's own dependency list is ~35 packages, most of which tiling never touches — a
+hyperparameter search stack (`smac` -> `pyrfr`, which needs swig to build on py>3.10), a GUI
+(`imgui`/`glfw`/`pyopengl`), umap/numba, rasterio, tensorboard — and timm would otherwise pull a
+second copy of torch from PyPI. The cost of `--no-deps` is that a transitive import slideflow makes
+lazily could be missing; the build runs `import slideflow; qc.Otsu()` to catch that at build time
+rather than on the cluster, so if something is missing, add it to the list in the
+[`Dockerfile`](Dockerfile) and rebuild.
 
 ## Run
 
