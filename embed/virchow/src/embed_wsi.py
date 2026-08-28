@@ -173,6 +173,9 @@ class SlideH5:
         self.grid = self._coords("grid")
         self.loc = self._coords("loc")
         self.n = 0
+        # running sum for the slide-level mean embedding; float64 so a slide with
+        # hundreds of thousands of tiles doesn't lose precision to accumulation
+        self.total = np.zeros(EMBED_DIM, dtype=np.float64)
 
     def _coords(self, name: str) -> h5py.Dataset:
         return self.f.create_dataset(
@@ -199,6 +202,12 @@ class SlideH5:
             ds.resize(self.n + n, axis=0)
             ds[self.n : self.n + n] = data
         self.n += n
+        self.total += features.sum(axis=0, dtype=np.float64)
+
+    def write_mean(self):
+        """Global average embedding over every tile in the slide."""
+        mean = self.total / self.n if self.n else np.full(EMBED_DIM, np.nan)
+        self.f.create_dataset("mean", data=mean.astype(np.float32))
 
     def write_metadata(self, meta: dict):
         for key, value in meta.items():
@@ -386,6 +395,7 @@ def embed_slide(
                 else:
                     raise ValueError(f"Unknown queue flag: {flag}")
             n_tiles = h5.n
+            h5.write_mean()
             h5.write_metadata(
                 slide_metadata(
                     wsi=wsi,
