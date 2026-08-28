@@ -64,8 +64,11 @@ _CTX = mp.get_context("forkserver")
 # queue flags between the reader thread and the inference loop
 _BATCH, _DONE, _ERROR = "batch", "done", "error"
 
-# how long to let a reader parked in q.put() finish once its pool is terminated
-READER_DRAIN_TIMEOUT_S = 2
+# draining a failed slide's reader: stop once it has gone quiet for this many
+# polls, with the total elapsed as a hard backstop
+READER_DRAIN_POLL_S = 0.1
+READER_DRAIN_QUIET_POLLS = 3
+READER_DRAIN_TIMEOUT_S = 30
 
 
 def open_slide(slide_path: Path) -> sf.WSI:
@@ -399,12 +402,13 @@ def embed_slide(
         # attempt to clean up the reader thread - the goal is not necessarily to
         # have the thread exit (the dead pool will cause it to hang), but to prevent
         # a reader stuck in `q.put` from holding on to excess memory - so we drain it
-        deadline = time.time() + READER_DRAIN_TIMEOUT_S
-        while reader.is_alive() and time.time() < deadline:
+        quiet_rounds, backstop = 0, time.time() + READER_DRAIN_TIMEOUT_S
+        while quiet_rounds < READER_DRAIN_QUIET_POLLS and time.time() < backstop:
             try:
-                q.get(timeout=0.1)
+                q.get(timeout=READER_DRAIN_POLL_S)
+                quiet_rounds = 0
             except queue.Empty:
-                pass
+                quiet_rounds += 1
         if reader.is_alive():
             logger.warning("tile reader for %s left behind", slide_path.name)
         pool.join()
