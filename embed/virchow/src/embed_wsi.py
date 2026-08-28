@@ -41,6 +41,10 @@ import slideflow.slide.qc as sf_qc
 import slideflow.util as sf_util
 import torch
 from PIL import Image
+from rich.console import Console
+from rich.highlighter import NullHighlighter
+from rich.logging import RichHandler
+from rich.markup import escape as rich_escape
 from tqdm import tqdm
 
 from virchow import (  # isort: skip
@@ -515,23 +519,61 @@ def parse_args():
     return p.parse_args()
 
 
-class TqdmLoggingHandler(logging.Handler):
-    """Emit through tqdm.write so log lines never smear the progress bars."""
+class TqdmStream:
+    """File-like shim so rich writes through tqdm.write and never smears a bar.
 
-    def emit(self, record: logging.LogRecord):
-        try:
-            tqdm.write(self.format(record), file=sys.stdout)
-        except Exception:
-            self.handleError(record)
+    isatty/fileno are delegated so rich still sees the real terminal and keeps its
+    color and width detection.
+    """
+
+    def write(self, text: str):
+        tqdm.write(text, file=sys.stdout, end="")
+
+    def flush(self):
+        sys.stdout.flush()
+
+    def isatty(self) -> bool:
+        return sys.stdout.isatty()
+
+    def fileno(self) -> int:
+        return sys.stdout.fileno()
+
+
+class MarkupFormatter(logging.Formatter):
+    """Escape rich markup in every message except slideflow's, which embeds it."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        msg = super().format(record)
+        if not record.name.startswith("slideflow"):
+            msg = rich_escape(msg)
+        return msg
+
+
+def setup_logging():
+    handler = RichHandler(
+        console=Console(file=TqdmStream()),
+        markup=True,
+        highlighter=NullHighlighter(),
+        show_path=False,
+        log_time_format="[%Y-%m-%d %H:%M:%S]",
+        rich_tracebacks=True,
+    )
+    handler.setFormatter(MarkupFormatter("%(name)s: %(message)s"))
+    logging.basicConfig(level=logging.WARNING, handlers=[handler])
+    logger.setLevel(logging.INFO)
+
+    # slideflow configures its own logging at import time: an INFO-level RichHandler
+    # of its own, a DEBUG-level file handler writing ./slideflow.log, and
+    # propagate=False, so basicConfig above never touches it. Hand its records back
+    # to the root handler and let our levels apply.
+    for h in list(sf_util.log.handlers):
+        sf_util.log.removeHandler(h)
+    sf_util.log.propagate = True
+    sf_util.log.setLevel(logging.WARNING)
 
 
 def main(args):
-    handler = TqdmLoggingHandler()
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    )
-    logging.basicConfig(level=logging.WARNING, handlers=[handler])
-    logger.setLevel(logging.INFO)
+    setup_logging()
 
     slides = find_slides(slide_dir=args.slide_dir, exts=args.exts)
     if not slides:
