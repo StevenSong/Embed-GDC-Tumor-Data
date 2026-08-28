@@ -68,16 +68,6 @@ _BATCH, _DONE, _ERROR = "batch", "done", "error"
 READER_DRAIN_TIMEOUT_S = 2
 
 
-class TqdmLoggingHandler(logging.Handler):
-    """Emit through tqdm.write so log lines never smear the progress bars."""
-
-    def emit(self, record: logging.LogRecord):
-        try:
-            tqdm.write(self.format(record), file=sys.stdout)
-        except Exception:
-            self.handleError(record)
-
-
 def open_slide(slide_path: Path) -> sf.WSI:
     """slideflow WSI at Virchow's magnification, with Otsu tissue detection applied."""
     wsi = sf.WSI(
@@ -330,9 +320,7 @@ def embed_slide(
     # queue contains tuples of (flag, item)
     q = queue.Queue(maxsize=queue_depth)
 
-    # one pool per slide so a failed slide's readers can be terminated. sharing one
-    # pool means an abandoned reader keeps its imap pumping: it buffers every
-    # remaining tile of the dead slide in memory and starves the next slide's reads
+    # one pool per slide so a failed slide's readers can be terminated
     pool = _CTX.Pool(
         processes=num_tile_readers,
         initializer=sf_util.set_ignore_sigint,
@@ -404,12 +392,13 @@ def embed_slide(
         tmp_path.unlink(missing_ok=True)
         raise
     finally:
-        # kill the workers: a dead pool produces no more tiles, so it can neither
-        # starve the next slide nor buffer the rest of this one in memory
+        # kill the worker pool - this won't actually cause slideflow to raise
+        # an exception, so the reader thread lives on - handled next
         pool.terminate()
-        # then let a reader parked in q.put() drain its way to the return. one
-        # already inside imap.next() will not wake -- terminate() never notifies
-        # pending results -- but with the pool dead it is a bounded daemon thread
+
+        # attempt to clean up the reader thread - the goal is not necessarily to
+        # have the thread exit (the dead pool will cause it to hang), but to prevent
+        # a reader stuck in `q.put` from holding on to excess memory - so we drain it
         deadline = time.time() + READER_DRAIN_TIMEOUT_S
         while reader.is_alive() and time.time() < deadline:
             try:
@@ -516,6 +505,16 @@ def parse_args():
         help="re-embed slides that already have an .h5",
     )
     return p.parse_args()
+
+
+class TqdmLoggingHandler(logging.Handler):
+    """Emit through tqdm.write so log lines never smear the progress bars."""
+
+    def emit(self, record: logging.LogRecord):
+        try:
+            tqdm.write(self.format(record), file=sys.stdout)
+        except Exception:
+            self.handleError(record)
 
 
 def main(args):
