@@ -45,8 +45,9 @@ that fails is logged and the run moves on, exiting non-zero at the end.
 | `--out-dir`          | `/out`                 | parent of `embeddings/` and `thumbnails/` |
 | `--exts`             | `.svs .tif .tiff .ndpi .scn .mrxs .bif .svslide` | slide extensions to look for |
 | `--batch-size`       | 64                     | tiles per forward pass                   |
-| `--num-tile-readers` | 8                      | worker processes reading tiles           |
+| `--num-tile-readers` | 8                      | worker processes reading tiles, per slide |
 | `--queue-depth`      | 8                      | tile batches buffered ahead of the GPU   |
+| `--stall-timeout`    | 600                    | fail a slide if no tiles arrive for this many seconds |
 | `--device`           | `cuda` if available    | torch device to embed on                 |
 | `--gzip-level`       | 4                      | `features` compression; 0 disables       |
 | `--thumbnail-width`  | 2048                   | masked thumbnail width in px             |

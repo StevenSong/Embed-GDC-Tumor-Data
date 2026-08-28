@@ -22,6 +22,7 @@ import time
 import warnings
 from collections.abc import Callable
 from datetime import datetime, timezone
+from multiprocessing import forkserver
 from multiprocessing.pool import Pool
 from pathlib import Path
 from typing import Iterable
@@ -56,14 +57,15 @@ SLIDE_EXTS = (".svs", ".tif", ".tiff", ".ndpi", ".scn", ".mrxs", ".bif", ".svsli
 STRIDE_DIV = 1  # no overlap between tiles
 H5_CHUNK_ROWS = 256
 
-# tile readers are forked before this process ever touches CUDA
+# tile reader processes are forked from the forkserver, which main() starts before
+# this process touches CUDA -- forking a CUDA-initialized parent wedges the child
 _CTX = mp.get_context("forkserver")
 
 # queue flags between the reader thread and the inference loop
 _BATCH, _DONE, _ERROR = "batch", "done", "error"
 
-# how long to keep unblocking the reader thread before giving up on it
-READER_DRAIN_TIMEOUT_S = 30
+# how long to let a reader parked in q.put() finish once its pool is terminated
+READER_DRAIN_TIMEOUT_S = 2
 
 
 class TqdmLoggingHandler(logging.Handler):
@@ -125,7 +127,7 @@ def read_tiles(
             grayspace_fraction=1,  # disable, just use the Otsu grid
             img_format="numpy",
             lazy_iter=True,  # keep memory usage down
-            pool=pool,  # prebuilt pool, shared across slides
+            pool=pool,  # this slide's reader pool, owned by embed_slide
             show_progress=False,
             max_tiles=max_tiles,
         )
@@ -299,8 +301,9 @@ def embed_slide(
     out_path: Path,
     thumbnail_path: Path,
     thumbnail_width: int,
-    pool: Pool,
+    num_tile_readers: int,
     queue_depth: int,
+    stall_timeout: float,
     model: WrappedVirchow,
     device: torch.device,
     batch_size: int,
@@ -327,8 +330,16 @@ def embed_slide(
     # queue contains tuples of (flag, item)
     q = queue.Queue(maxsize=queue_depth)
 
+    # one pool per slide so a failed slide's readers can be terminated. sharing one
+    # pool means an abandoned reader keeps its imap pumping: it buffers every
+    # remaining tile of the dead slide in memory and starves the next slide's reads
+    pool = _CTX.Pool(
+        processes=num_tile_readers,
+        initializer=sf_util.set_ignore_sigint,
+    )
+
     # start reader thread for asynchronously producing tiles,
-    # reader uses separate multiprocessing pool for actual read
+    # reader uses the pool above for the actual reads
     reader = threading.Thread(
         target=read_tiles,
         kwargs={
@@ -357,7 +368,15 @@ def embed_slide(
             ) as tile_bar,
         ):
             while True:
-                flag, item = q.get()
+                try:
+                    flag, item = q.get(timeout=stall_timeout)
+                except queue.Empty:
+                    # a read wedged in libvips never reports back, so without this
+                    # the whole run would sit here waiting on one bad slide
+                    raise TimeoutError(
+                        f"no tiles from the reader in {stall_timeout:.0f}s; "
+                        f"{slide_path.name} looks stalled"
+                    ) from None
                 if flag == _BATCH:
                     imgs, grid, loc = item
                     embs = embed_batch(model=model, device=device, imgs=imgs)
@@ -385,16 +404,21 @@ def embed_slide(
         tmp_path.unlink(missing_ok=True)
         raise
     finally:
-        # bailing early leaves the reader parked in q.put() on the bounded queue, so
-        # it never reaches its return: drain to unblock it rather than join a wedge
+        # kill the workers: a dead pool produces no more tiles, so it can neither
+        # starve the next slide nor buffer the rest of this one in memory
+        pool.terminate()
+        # then let a reader parked in q.put() drain its way to the return. one
+        # already inside imap.next() will not wake -- terminate() never notifies
+        # pending results -- but with the pool dead it is a bounded daemon thread
         deadline = time.time() + READER_DRAIN_TIMEOUT_S
         while reader.is_alive() and time.time() < deadline:
             try:
                 q.get(timeout=0.1)
             except queue.Empty:
                 pass
-        if reader.is_alive():  # still holding pool workers; flag it, don't hang
-            logger.warning("tile reader for %s did not exit", slide_path.name)
+        if reader.is_alive():
+            logger.warning("tile reader for %s left behind", slide_path.name)
+        pool.join()
 
     elapsed = time.time() - start
     logger.info(
@@ -460,6 +484,12 @@ def parse_args():
         help="tile batches buffered ahead of the GPU",
     )
     p.add_argument(
+        "--stall-timeout",
+        type=float,
+        default=600.0,
+        help="fail a slide if no tile batch arrives for this many seconds",
+    )
+    p.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
@@ -506,47 +536,42 @@ def main(args):
     thumb_dir.mkdir(parents=True, exist_ok=True)
     logger.info("found %d slides under %s", len(slides), args.slide_dir)
 
-    # build the reader pool before the CUDA context exists
-    pool = _CTX.Pool(
-        processes=args.num_tile_readers,
-        initializer=sf_util.set_ignore_sigint,
-    )
+    # start the forkserver before the CUDA context exists: every per-slide pool is
+    # forked from that process, so no reader ever inherits a CUDA context
+    forkserver.ensure_running()
 
     device = torch.device(args.device)
     model = WrappedVirchow().eval().to(device)
     logger.info("virchow ready on %s", device)
 
     failed = []
-    try:
-        with tqdm(slides, desc="slides", unit="slide", position=0) as slide_bar:
-            for i, slide_path in enumerate(slide_bar, start=1):
-                out_path = embed_dir / f"{slide_path.stem}.h5"
-                if out_path.exists() and not args.overwrite:
-                    logger.info(
-                        "[%d/%d] %s exists, skipping", i, len(slides), out_path.name
-                    )
-                    continue
-                logger.info("[%d/%d] %s", i, len(slides), slide_path.name)
-                try:
-                    embed_slide(
-                        slide_path=slide_path,
-                        out_path=out_path,
-                        thumbnail_path=thumb_dir / f"{slide_path.stem}.png",
-                        thumbnail_width=args.thumbnail_width,
-                        pool=pool,
-                        queue_depth=args.queue_depth,
-                        model=model,
-                        device=device,
-                        batch_size=args.batch_size,
-                        gzip_level=args.gzip_level,
-                        max_tiles=args.max_tiles,
-                    )
-                except Exception:
-                    logger.exception("failed to embed %s", slide_path.name)
-                    failed.append(slide_path.name)
-    finally:
-        pool.close()
-        pool.join()
+    with tqdm(slides, desc="slides", unit="slide", position=0) as slide_bar:
+        for i, slide_path in enumerate(slide_bar, start=1):
+            out_path = embed_dir / f"{slide_path.stem}.h5"
+            if out_path.exists() and not args.overwrite:
+                logger.info(
+                    "[%d/%d] %s exists, skipping", i, len(slides), out_path.name
+                )
+                continue
+            logger.info("[%d/%d] %s", i, len(slides), slide_path.name)
+            try:
+                embed_slide(
+                    slide_path=slide_path,
+                    out_path=out_path,
+                    thumbnail_path=thumb_dir / f"{slide_path.stem}.png",
+                    thumbnail_width=args.thumbnail_width,
+                    num_tile_readers=args.num_tile_readers,
+                    queue_depth=args.queue_depth,
+                    stall_timeout=args.stall_timeout,
+                    model=model,
+                    device=device,
+                    batch_size=args.batch_size,
+                    gzip_level=args.gzip_level,
+                    max_tiles=args.max_tiles,
+                )
+            except Exception:
+                logger.exception("failed to embed %s", slide_path.name)
+                failed.append(slide_path.name)
 
     if failed:
         logger.error(
