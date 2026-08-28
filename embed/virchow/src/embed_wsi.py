@@ -403,7 +403,11 @@ def embed_slide(
         # have the thread exit (the dead pool will cause it to hang), but to prevent
         # a reader stuck in `q.put` from holding on to excess memory - so we drain it
         quiet_rounds, backstop = 0, time.time() + READER_DRAIN_TIMEOUT_S
-        while quiet_rounds < READER_DRAIN_QUIET_POLLS and time.time() < backstop:
+        while (
+            reader.is_alive()  # only do the drain if reader isn't gracefully exiting
+            and quiet_rounds < READER_DRAIN_QUIET_POLLS
+            and time.time() < backstop
+        ):
             try:
                 q.get(timeout=READER_DRAIN_POLL_S)
                 quiet_rounds = 0
