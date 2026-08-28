@@ -32,14 +32,12 @@ import slideflow.util as sf_util
 import torch
 from PIL import Image
 
-from virchow import (
-    AUTOCAST_DTYPES,
-    DEFAULT_PRECISION,
+from virchow import (  # isort: skip
     EMBED_DIM,
     HF_HUB_ID,
     TILE_PX,
     TILE_UM,
-    load_model,
+    WrappedVirchow,
 )
 
 logger = logging.getLogger("embed_wsi")
@@ -102,7 +100,9 @@ def read_tiles(wsi, pool, batch_size, max_tiles, q):
         n_read = 0
         for tile in gen():
             if n_read == 0 and "loc" not in tile:
-                logger.warning("slideflow tiles carry no 'loc'; pixel coords will be -1")
+                logger.warning(
+                    "slideflow tiles carry no 'loc'; pixel coords will be -1"
+                )
             imgs.append(tile["image"].transpose(2, 0, 1))  # (C, H, W)
             grids.append(tile["grid"])
             locs.append(tile.get("loc", (-1, -1)))
@@ -126,7 +126,11 @@ class SlideH5:
     """Streaming writer: embeddings are appended per batch, never held in full."""
 
     def __init__(self, path, gzip_level):
-        compression = {"compression": "gzip", "compression_opts": gzip_level} if gzip_level else {}
+        compression = (
+            {"compression": "gzip", "compression_opts": gzip_level}
+            if gzip_level
+            else {}
+        )
         self.f = h5py.File(path, "w")
         self.features = self.f.create_dataset(
             "features",
@@ -192,7 +196,7 @@ def save_masked_thumbnail(wsi, path, width, qc_img=None):
     return path
 
 
-def slide_metadata(wsi, slide_path, n_tiles, precision, thumb_path):
+def slide_metadata(wsi, slide_path, n_tiles, thumb_path):
     grid = getattr(wsi, "grid", None)
     grid_shape = np.asarray(grid).shape[:2] if grid is not None else (0, 0)
     return {
@@ -206,7 +210,7 @@ def slide_metadata(wsi, slide_path, n_tiles, precision, thumb_path):
         "tile_um": TILE_UM,
         "stride_div": STRIDE_DIV,
         "qc": "otsu",
-        "precision": precision,
+        "precision": "fp16",
         "mpp": float(wsi.mpp) if wsi.mpp else float("nan"),
         "slide_dimensions": np.asarray(wsi.dimensions, dtype=np.int64),
         "grid_shape": np.asarray(grid_shape, dtype=np.int64),
@@ -220,14 +224,11 @@ def slide_metadata(wsi, slide_path, n_tiles, precision, thumb_path):
 # --------------------------------------------------------------------------- #
 # embedding
 # --------------------------------------------------------------------------- #
-def embed_batch(model, device, autocast_dtype, imgs):
+def embed_batch(model, device, imgs):
     x = torch.from_numpy(imgs).to(device, non_blocking=True)
     with torch.inference_mode():
-        if autocast_dtype is None:
+        with torch.autocast(device_type=device.type, dtype="fp16"):
             emb = model(x)
-        else:
-            with torch.autocast(device_type=device.type, dtype=autocast_dtype):
-                emb = model(x)
         # Virchow returns fp32 even under autocast (final op is a mixed-precision
         # LayerNorm); the cast is belt and braces
         return emb.float().cpu().numpy()
@@ -235,7 +236,6 @@ def embed_batch(model, device, autocast_dtype, imgs):
 
 def embed_slide(slide_path, out_path, thumb_path, model, device, pool, args):
     start = time.time()
-    autocast_dtype = AUTOCAST_DTYPES[args.precision]
 
     wsi, qc_img = open_slide(slide_path)
     estimated = int(getattr(wsi, "estimated_num_tiles", 0) or 0)
@@ -265,11 +265,13 @@ def embed_slide(slide_path, out_path, thumb_path, model, device, pool, args):
             while True:
                 kind, item = q.get()
                 if kind == _ERROR:
-                    raise RuntimeError(f"tile reader failed for {slide_path.name}") from item
+                    raise RuntimeError(
+                        f"tile reader failed for {slide_path.name}"
+                    ) from item
                 if kind == _DONE:
                     break
                 imgs, grid, loc = item
-                h5.append(embed_batch(model, device, autocast_dtype, imgs), grid, loc)
+                h5.append(embed_batch(model, device, imgs), grid, loc)
                 n_batches += 1
                 if n_batches % args.log_every == 0:
                     rate = h5.n / max(time.time() - start, 1e-6)
@@ -281,9 +283,7 @@ def embed_slide(slide_path, out_path, thumb_path, model, device, pool, args):
                         rate,
                     )
             n_tiles = h5.n
-            h5.write_metadata(
-                slide_metadata(wsi, slide_path, n_tiles, args.precision, thumb_path)
-            )
+            h5.write_metadata(slide_metadata(wsi, slide_path, n_tiles, thumb_path))
         os.replace(tmp_path, out_path)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
@@ -314,32 +314,67 @@ def embed_slide(slide_path, out_path, thumb_path, model, device, pool, args):
 # --------------------------------------------------------------------------- #
 def find_slides(slide_dir, exts):
     exts = {e.lower() if e.startswith(".") else f".{e.lower()}" for e in exts}
-    return sorted(p for p in slide_dir.rglob("*") if p.is_file() and p.suffix.lower() in exts)
+    return sorted(
+        p for p in slide_dir.rglob("*") if p.is_file() and p.suffix.lower() in exts
+    )
 
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("--slide-dir", type=Path, required=True, help="directory of WSIs, searched recursively")
-    p.add_argument("--out-dir", type=Path, required=True, help="where the per-slide .h5 files go")
-    p.add_argument("--thumbnail-dir", type=Path, default=None, help="default: <out-dir>/thumbnails")
-    p.add_argument("--ext", nargs="+", default=list(SLIDE_EXTS), help="slide extensions to look for")
-    p.add_argument("--batch-size", type=int, default=64, help="tiles per forward pass")
-    p.add_argument("--num-tile-readers", type=int, default=8, help="worker processes decoding tiles")
-    p.add_argument("--queue-depth", type=int, default=8, help="tile batches buffered ahead of the GPU")
     p.add_argument(
-        "--precision",
-        choices=sorted(AUTOCAST_DTYPES),
-        default=DEFAULT_PRECISION,
-        help="autocast dtype; fp16 is what the Virchow model card prescribes",
+        "--slide-dir",
+        type=Path,
+        required=True,
+        help="directory of WSIs, searched recursively",
+    )
+    p.add_argument(
+        "--out-dir", type=Path, required=True, help="where the per-slide .h5 files go"
+    )
+    p.add_argument(
+        "--thumbnail-dir", type=Path, default=None, help="default: <out-dir>/thumbnails"
+    )
+    p.add_argument(
+        "--ext",
+        nargs="+",
+        default=list(SLIDE_EXTS),
+        help="slide extensions to look for",
+    )
+    p.add_argument("--batch-size", type=int, default=64, help="tiles per forward pass")
+    p.add_argument(
+        "--num-tile-readers",
+        type=int,
+        default=8,
+        help="worker processes decoding tiles",
+    )
+    p.add_argument(
+        "--queue-depth",
+        type=int,
+        default=8,
+        help="tile batches buffered ahead of the GPU",
     )
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--gzip-level", type=int, default=4, help="0 disables compression of features")
-    p.add_argument("--thumbnail-width", type=int, default=2048, help="masked thumbnail width in px")
-    p.add_argument("--max-tiles", type=int, default=0, help="cap tiles per slide (0 = all); for smoke tests")
-    p.add_argument("--overwrite", action="store_true", help="re-embed slides that already have an .h5")
-    p.add_argument("--log-every", type=int, default=50, help="log progress every N batches")
+    p.add_argument(
+        "--gzip-level", type=int, default=4, help="0 disables compression of features"
+    )
+    p.add_argument(
+        "--thumbnail-width", type=int, default=2048, help="masked thumbnail width in px"
+    )
+    p.add_argument(
+        "--max-tiles",
+        type=int,
+        default=0,
+        help="cap tiles per slide (0 = all); for smoke tests",
+    )
+    p.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="re-embed slides that already have an .h5",
+    )
+    p.add_argument(
+        "--log-every", type=int, default=50, help="log progress every N batches"
+    )
     return p.parse_args(argv)
 
 
@@ -363,20 +398,26 @@ def main(argv=None):
 
     # build the reader pool before the CUDA context exists: forking a process that
     # already initialized CUDA is a well-known way to get stuck children
-    pool = _CTX.Pool(processes=args.num_tile_readers, initializer=sf_util.set_ignore_sigint)
+    pool = _CTX.Pool(
+        processes=args.num_tile_readers, initializer=sf_util.set_ignore_sigint
+    )
 
     device = torch.device(args.device)
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
-    model = load_model(device)
-    logger.info("virchow ready on %s (%s)", device, args.precision)
+    model = WrappedVirchow()
+    model.eval()
+    model.to(device)
+    logger.info("virchow ready on %s", device)
 
     failed = []
     try:
         for i, slide_path in enumerate(slides, start=1):
             out_path = out_dir / f"{slide_path.stem}.h5"
             if out_path.exists() and not args.overwrite:
-                logger.info("[%d/%d] %s exists, skipping", i, len(slides), out_path.name)
+                logger.info(
+                    "[%d/%d] %s exists, skipping", i, len(slides), out_path.name
+                )
                 continue
             logger.info("[%d/%d] %s", i, len(slides), slide_path.name)
             try:
@@ -397,7 +438,9 @@ def main(argv=None):
         pool.join()
 
     if failed:
-        logger.error("%d/%d slides failed: %s", len(failed), len(slides), ", ".join(failed))
+        logger.error(
+            "%d/%d slides failed: %s", len(failed), len(slides), ", ".join(failed)
+        )
         return 1
     logger.info("done: %d slides", len(slides))
     return 0

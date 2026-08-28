@@ -51,23 +51,3 @@ class WrappedVirchow(nn.Module):
         x = torch.cat([cls_emb, patch_embs.mean(1)], dim=-1)  # (B, 2560)
 
         return x
-
-
-# The Virchow model card prescribes fp16 autocast for inference:
-#   with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.float16):
-# The embedding still comes back fp32 -- the final op is a LayerNorm run in mixed
-# precision. bf16/fp32 are kept as escape hatches for debugging.
-AUTOCAST_DTYPES = {
-    "fp16": torch.float16,
-    "bf16": torch.bfloat16,
-    "fp32": None,  # no autocast
-}
-DEFAULT_PRECISION = "fp16"
-
-
-def load_model(device):
-    """Build Virchow with the weights baked into the image (see download_model.py)."""
-    model = WrappedVirchow()
-    model.eval()
-    model.to(device)
-    return model
