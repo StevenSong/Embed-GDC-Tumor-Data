@@ -22,6 +22,7 @@ import time
 import warnings
 from collections.abc import Callable
 from datetime import datetime, timezone
+from multiprocessing.pool import Pool
 from pathlib import Path
 from typing import Iterable
 
@@ -96,15 +97,14 @@ def _stack(
 def read_tiles(
     *,  # enforce kwargs
     wsi: sf.WSI,
-    pool: mp.Pool,  # @Claude same comment as other pool # type: ignore
+    pool: Pool,
     batch_size: int,
     q: queue.Queue,
     max_tiles: int | None = None,
 ):
     """Fill `q` with tile batches. Runs on a worker thread so reads overlap inference."""
     try:
-        # @Claude what's the type of the tiles returned by the generator?
-        gen: Callable[[], Iterable["Tile"]] = wsi.build_generator(  # type: ignore
+        gen: Callable[[], Iterable[dict]] = wsi.build_generator(  # type: ignore
             shuffle=False,
             deterministic=True,
             whitespace_fraction=1,  # disable, just use the Otsu grid
@@ -219,9 +219,10 @@ def save_masked_thumbnail(
     if mask is None:
         raise ValueError(f"no qc mask for {path.stem}")
 
-    # @Claude give a 1 line comment for why you do this conversion of mask/rejected instead of jusing using the numpy mask
-    mask = Image.fromarray((np.asarray(mask) > 0).astype(np.uint8) * 255)
-    rejected = np.asarray(mask.resize(thumb.size, Image.Resampling.NEAREST)) > 127
+    # the QC mask is at the QC downsample level, so resample it to the thumbnail's
+    # size; PIL is the shortest route to a nearest-neighbour resize of a bool array
+    mask = Image.fromarray((np.asarray(mask) > 0).astype(np.uint8))
+    rejected = np.asarray(mask.resize(thumb.size, Image.Resampling.NEAREST)) > 0
     tint = np.array([20.0, 26.0, 56.0], dtype=np.float32)
     rgb[rejected] = 0.35 * rgb[rejected] + 0.65 * tint
 
@@ -284,7 +285,7 @@ def embed_slide(
     out_path: Path,
     thumbnail_path: Path,
     thumbnail_width: int,
-    pool: mp.Pool,  # @Claude linter complains this type hint is a variable, mp.pool.Pool also fails because `.pool` isnt detected # type: ignore
+    pool: Pool,
     queue_depth: int,
     model: WrappedVirchow,
     device: torch.device,
@@ -487,8 +488,6 @@ def main(args):
     )
 
     device = torch.device(args.device)
-    if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True  # @Claude why do this?
     model = WrappedVirchow().eval().to(device)
     logger.info("virchow ready on %s", device)
 
