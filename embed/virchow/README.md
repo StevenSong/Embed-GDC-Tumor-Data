@@ -14,7 +14,7 @@ held in memory and streamed to the GPU; they are never written to disk.
 
 Virchow is gated, so the build needs a Hugging Face account with access to
 [paige-ai/Virchow](https://huggingface.co/paige-ai/Virchow). The weights are pulled into the image
-at build time, and the token is passed as a BuildKit secret (Docker 23+ uses BuildKit by default):
+at build time, and the token is passed as a BuildKit secret:
 
 ```bash
 HF_TOKEN=hf_xxx docker build --secret id=hf_token,env=HF_TOKEN -t virchow-embed embed/virchow
@@ -36,23 +36,6 @@ unless `--overwrite` is passed, so an interrupted run can simply be restarted. A
 logged and the run moves on, exiting non-zero at the end.
 
 `--max-tiles 256` caps the work per slide, for a quick check that the whole path works.
-
-### Multiple GPUs
-
-One container per GPU, over disjoint input directories:
-
-```bash
-docker run --rm --gpus '"device=0"' -v /slides/part0:/slides:ro -v /out:/out virchow-embed --slide-dir /slides --out-dir /out &
-docker run --rm --gpus '"device=1"' -v /slides/part1:/slides:ro -v /out:/out virchow-embed --slide-dir /slides --out-dir /out &
-```
-
-### Apptainer
-
-```bash
-apptainer build virchow-embed.sif docker-daemon://virchow-embed:latest
-apptainer run --nv -B /path/to/slides:/slides,/path/to/out:/out virchow-embed.sif \
-  --slide-dir /slides --out-dir /out
-```
 
 ### Flags
 
@@ -94,11 +77,3 @@ Root attributes record how the file was produced: `slide`, `slide_path`, `encode
 `encoder_source`, `embed_dim`, `n_tiles`, `tile_px`, `tile_um`, `stride_div`, `qc`, `precision`,
 `mpp`, `slide_dimensions`, `grid_shape`, `thumbnail`, `created_utc`, `torch_version`,
 `slideflow_version`.
-
-## Files
-
-* [`Dockerfile`](Dockerfile) — image, including the build-time weight pull
-* [`requirements.txt`](requirements.txt) — torch (pinned), timm, and our own deps
-* [`requirements-slideflow.txt`](requirements-slideflow.txt) — slideflow's minimal import set
-* [`src/virchow.py`](src/virchow.py) — the model wrapper
-* [`src/embed_wsi.py`](src/embed_wsi.py) — the CLI that walks a slide directory
