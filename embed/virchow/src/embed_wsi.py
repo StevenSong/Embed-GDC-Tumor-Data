@@ -40,6 +40,7 @@ import slideflow.slide.qc as sf_qc
 import slideflow.util as sf_util
 import torch
 from PIL import Image
+from tqdm import tqdm
 
 from virchow import (  # isort: skip
     EMBED_DIM,
@@ -60,6 +61,19 @@ _CTX = mp.get_context("forkserver")
 
 # queue flags between the reader thread and the inference loop
 _BATCH, _DONE, _ERROR = "batch", "done", "error"
+
+# how long to keep unblocking the reader thread before giving up on it
+READER_DRAIN_TIMEOUT_S = 30
+
+
+class TqdmLoggingHandler(logging.Handler):
+    """Emit through tqdm.write so log lines never smear the progress bars."""
+
+    def emit(self, record: logging.LogRecord):
+        try:
+            tqdm.write(self.format(record), file=sys.stdout)
+        except Exception:
+            self.handleError(record)
 
 
 def open_slide(slide_path: Path) -> sf.WSI:
@@ -305,6 +319,11 @@ def embed_slide(
     )
     save_masked_thumbnail(wsi=wsi, path=thumbnail_path, width=thumbnail_width)
 
+    # only an estimate: the Otsu grid is counted before tiles are actually read
+    n_expected = wsi.estimated_num_tiles
+    if max_tiles is not None:
+        n_expected = min(n_expected, max_tiles)
+
     # queue contains tuples of (flag, item)
     q = queue.Queue(maxsize=queue_depth)
 
@@ -327,13 +346,23 @@ def embed_slide(
     # write to a temp file so a crashed run never leaves a plausible-looking .h5
     tmp_path = out_path.with_name(f".{out_path.name}.tmp")
     try:
-        with SlideH5(path=tmp_path, gzip_level=gzip_level) as h5:
+        with (
+            SlideH5(path=tmp_path, gzip_level=gzip_level) as h5,
+            tqdm(
+                total=n_expected,
+                desc=slide_path.name,
+                unit="tile",
+                leave=False,
+                position=1,
+            ) as tile_bar,
+        ):
             while True:
                 flag, item = q.get()
                 if flag == _BATCH:
                     imgs, grid, loc = item
                     embs = embed_batch(model=model, device=device, imgs=imgs)
                     h5.append(features=embs, grid=grid, loc=loc)
+                    tile_bar.update(len(embs))
                 elif flag == _DONE:
                     break
                 elif flag == _ERROR:
@@ -356,14 +385,16 @@ def embed_slide(
         tmp_path.unlink(missing_ok=True)
         raise
     finally:
-        # @Claude why is this queue emptying needed? why not just join the reader thread?
-        # if we bailed early the reader may be blocked on a full queue
-        while reader.is_alive():
+        # bailing early leaves the reader parked in q.put() on the bounded queue, so
+        # it never reaches its return: drain to unblock it rather than join a wedge
+        deadline = time.time() + READER_DRAIN_TIMEOUT_S
+        while reader.is_alive() and time.time() < deadline:
             try:
                 q.get(timeout=0.1)
             except queue.Empty:
                 pass
-        reader.join(timeout=5)
+        if reader.is_alive():  # still holding pool workers; flag it, don't hang
+            logger.warning("tile reader for %s did not exit", slide_path.name)
 
     elapsed = time.time() - start
     logger.info(
@@ -454,21 +485,15 @@ def parse_args():
         action="store_true",
         help="re-embed slides that already have an .h5",
     )
-    p.add_argument(
-        "--log-every",
-        type=int,
-        default=50,
-        help="log progress every N batches",
-    )
     return p.parse_args()
 
 
 def main(args):
-    logging.basicConfig(
-        level=logging.WARNING,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        stream=sys.stdout,
+    handler = TqdmLoggingHandler()
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     )
+    logging.basicConfig(level=logging.WARNING, handlers=[handler])
     logger.setLevel(logging.INFO)
 
     slides = find_slides(slide_dir=args.slide_dir, exts=args.exts)
@@ -493,32 +518,32 @@ def main(args):
 
     failed = []
     try:
-        # @Claude wrap this loop in tqdm progress bar (but keep the log for which slide it's working on)
-        for i, slide_path in enumerate(slides, start=1):
-            out_path = embed_dir / f"{slide_path.stem}.h5"
-            if out_path.exists() and not args.overwrite:
-                logger.info(
-                    "[%d/%d] %s exists, skipping", i, len(slides), out_path.name
-                )
-                continue
-            logger.info("[%d/%d] %s", i, len(slides), slide_path.name)
-            try:
-                embed_slide(
-                    slide_path=slide_path,
-                    out_path=out_path,
-                    thumbnail_path=thumb_dir / f"{slide_path.stem}.png",
-                    thumbnail_width=args.thumbnail_width,
-                    pool=pool,
-                    queue_depth=args.queue_depth,
-                    model=model,
-                    device=device,
-                    batch_size=args.batch_size,
-                    gzip_level=args.gzip_level,
-                    max_tiles=args.max_tiles,
-                )
-            except Exception:
-                logger.exception("failed to embed %s", slide_path.name)
-                failed.append(slide_path.name)
+        with tqdm(slides, desc="slides", unit="slide", position=0) as slide_bar:
+            for i, slide_path in enumerate(slide_bar, start=1):
+                out_path = embed_dir / f"{slide_path.stem}.h5"
+                if out_path.exists() and not args.overwrite:
+                    logger.info(
+                        "[%d/%d] %s exists, skipping", i, len(slides), out_path.name
+                    )
+                    continue
+                logger.info("[%d/%d] %s", i, len(slides), slide_path.name)
+                try:
+                    embed_slide(
+                        slide_path=slide_path,
+                        out_path=out_path,
+                        thumbnail_path=thumb_dir / f"{slide_path.stem}.png",
+                        thumbnail_width=args.thumbnail_width,
+                        pool=pool,
+                        queue_depth=args.queue_depth,
+                        model=model,
+                        device=device,
+                        batch_size=args.batch_size,
+                        gzip_level=args.gzip_level,
+                        max_tiles=args.max_tiles,
+                    )
+                except Exception:
+                    logger.exception("failed to embed %s", slide_path.name)
+                    failed.append(slide_path.name)
     finally:
         pool.close()
         pool.join()

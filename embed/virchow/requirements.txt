@@ -13,3 +13,4 @@ h5py                    # per-slide HDF5 output
 timm                    # Virchow is a timm model: hf-hub:paige-ai/Virchow
 torch==2.13.0
 torchvision==0.28.0
+tqdm                    # progress bars over slides and tiles
