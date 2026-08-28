@@ -223,3 +223,4 @@ gdc-client
 sample/
 out/
 *.pt
+temp/

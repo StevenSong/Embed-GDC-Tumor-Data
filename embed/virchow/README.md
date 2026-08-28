@@ -25,7 +25,7 @@ The running container never contacts huggingface.co.
 ## Run
 
 ```bash
-docker run --rm --gpus '"device=0"' \
+docker run -it --rm --gpus '"device=0"' \
   -v /path/to/slides:/slides:ro \
   -v /path/to/out:/out \
   virchow-embed --slide-dir /slides --out-dir /out

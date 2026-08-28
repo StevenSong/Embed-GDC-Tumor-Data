@@ -27,18 +27,18 @@ ENV PYTHONUNBUFFERED=1 \
     SF_BACKEND=torch \
     HF_HOME=/opt/hf
 
-COPY src/ /app/src/
-
 # paige-ai/Virchow is gated, so the build needs a HF token with access to the repo.
 # It comes in as a BuildKit secret rather than an ARG, which would be readable in
 # the image history forever. The weights land in $HF_HOME and ship in the image.
 WORKDIR /app/src/
 RUN --mount=type=secret,id=hf_token,required=true \
     HF_TOKEN="$(cat /run/secrets/hf_token)" \
-    python -c "from virchow import WrappedVirchow; WrappedVirchow()" \
+    python -c 'import timm, torch; timm.create_model("hf-hub:paige-ai/Virchow", pretrained=True, mlp_layer=timm.layers.SwiGLUPacked, act_layer=torch.nn.SiLU)' \
  && chmod -R a+rX "$HF_HOME"
 
 # weights are in the image now; never reach for the network at runtime
 ENV HF_HUB_OFFLINE=1
+
+COPY src/ /app/src/
 
 ENTRYPOINT ["python", "/app/src/embed_wsi.py"]

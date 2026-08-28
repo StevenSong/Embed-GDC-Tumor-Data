@@ -10,7 +10,7 @@ Source: https://huggingface.co/paige-ai/Virchow
 import timm
 import torch
 import torch.nn as nn
-from timm.layers import SwiGLUPacked
+from timm.layers.mlp import SwiGLUPacked
 
 HF_HUB_ID = "hf-hub:paige-ai/Virchow"
 TILE_PX = 224
