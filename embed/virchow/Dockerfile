@@ -12,7 +12,7 @@ RUN apt-get update \
  && apt-get clean \
  && rm -rf /var/lib/apt/lists/*
 
-COPY . /app/
+COPY requirements.txt requirements-slideflow.txt /app/
 
 # our main requirements for doing embedding
 RUN pip install --no-cache-dir -r /app/requirements.txt
@@ -27,6 +27,8 @@ ENV PYTHONUNBUFFERED=1 \
     SF_BACKEND=torch \
     HF_HOME=/opt/hf
 
+COPY src/ /app/src/
+
 # paige-ai/Virchow is gated, so the build needs a HF token with access to the repo.
 # It comes in as a BuildKit secret rather than an ARG, which would be readable in
 # the image history forever. The weights land in $HF_HOME and ship in the image.
@@ -39,4 +41,4 @@ RUN --mount=type=secret,id=hf_token,required=true \
 # weights are in the image now; never reach for the network at runtime
 ENV HF_HUB_OFFLINE=1
 
-ENTRYPOINT ["python", "/app/embed_wsi.py"]
+ENTRYPOINT ["python", "/app/src/embed_wsi.py"]

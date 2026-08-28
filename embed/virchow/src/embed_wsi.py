@@ -1,11 +1,9 @@
 #!/usr/bin/env python
 """Tile WSIs with slideflow and embed every tile with Virchow, one HDF5 per slide.
 
-A standalone take on ../../kserve-demo: same tiling (Otsu tissue detection, 224 px
-tiles at 20x) and same embeddings, but Virchow runs in this process on the local
-GPU, so there is no transformer/predictor split and no gRPC hop. Tiles live in
-memory and stream straight to the GPU -- the only things written to disk are the
-per-slide HDF5 and its thumbnail.
+Slides are tiled with Otsu tissue detection at 224 px / 20x, and Virchow runs in this
+process on the local GPU. Tiles live in memory and stream straight to the GPU -- the
+only things written to disk are the per-slide HDF5 and its thumbnail.
 
     python embed_wsi.py --slide-dir /data/slides --out-dir /data/embeddings
 
@@ -100,12 +98,12 @@ def read_tiles(wsi, pool, batch_size, max_tiles, q):
         n_read = 0
         for tile in gen():
             if n_read == 0 and "loc" not in tile:
-                logger.warning(
-                    "slideflow tiles carry no 'loc'; pixel coords will be -1"
+                raise KeyError(
+                    f"slideflow tiles carry no 'loc'; got keys {sorted(tile)}"
                 )
             imgs.append(tile["image"].transpose(2, 0, 1))  # (C, H, W)
             grids.append(tile["grid"])
-            locs.append(tile.get("loc", (-1, -1)))
+            locs.append(tile["loc"])
             n_read += 1
             if len(imgs) == batch_size:
                 q.put((_BATCH, _stack(imgs, grids, locs)))
@@ -227,7 +225,8 @@ def slide_metadata(wsi, slide_path, n_tiles, thumb_path):
 def embed_batch(model, device, imgs):
     x = torch.from_numpy(imgs).to(device, non_blocking=True)
     with torch.inference_mode():
-        with torch.autocast(device_type=device.type, dtype="fp16"):
+        # fp16 autocast is what the Virchow model card prescribes
+        with torch.autocast(device_type=device.type, dtype=torch.float16):
             emb = model(x)
         # Virchow returns fp32 even under autocast (final op is a mixed-precision
         # LayerNorm); the cast is belt and braces

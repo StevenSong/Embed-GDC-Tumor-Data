@@ -1,10 +1,8 @@
 """Virchow tile encoder.
 
-Same wrapper as the TorchScript export in ../../kserve-demo/virchow-torchscript.ipynb:
-normalization and Virchow's embedding step (concat of the class token with the mean
-of the patch tokens) are baked into the module, so the module takes uint8 tiles and
-returns (B, 2560) float32 embeddings. Here the model runs in-process instead of
-behind Triton, so we keep it in eager mode and let autocast handle precision.
+Normalization and Virchow's embedding step (concat of the class token with the mean of
+the patch tokens) are baked into the module, so it takes uint8 tiles and returns
+(B, 2560) float32 embeddings. Kept in eager mode; the caller runs it under autocast.
 
 Source: https://huggingface.co/paige-ai/Virchow
 """

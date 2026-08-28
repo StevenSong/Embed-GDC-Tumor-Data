@@ -1,64 +1,26 @@
-# Virchow tile embeddings (no KServe)
+# Virchow Tile Embeddings
 
-One container, one command: point it at a directory of whole-slide images and it writes one HDF5
-of [Virchow](https://huggingface.co/paige-ai/Virchow) tile embeddings per slide, plus a thumbnail
-showing what tissue detection kept.
+Embeds whole-slide images with [Virchow](https://huggingface.co/paige-ai/Virchow). Point the
+container at a directory of WSIs and it writes, per slide:
 
-```
-  /slides/*.svs  -->  slideflow tiling (Otsu, 224 px @ 20x)  -->  Virchow  -->  /out/<slide>.h5
-                              ^ forkserver pool                     ^ local GPU     /out/thumbnails/<slide>.png
-                              +---- tile batches in memory ---------+
-```
+* `<out-dir>/<slide>.h5` — one embedding per tile, with tile coordinates
+* `<out-dir>/thumbnails/<slide>.png` — the slide thumbnail with non-tissue dimmed out
 
-Same tiling and same embeddings as [`../../kserve-demo`](../../kserve-demo), minus the serving
-machinery: the model runs in-process, so there is no transformer/predictor split, no gRPC hop, and
-no TorchScript export. Tiles are never written to disk — no tile directories, no tfrecords — they
-go from the slide reader into a bounded queue and straight onto the GPU.
+Slides are tiled with [slideflow](https://github.com/jamesdolezal/slideflow) into 224 px tiles at
+20x (0.5 MPP) under Otsu tissue detection, and each tile is embedded on the local GPU. Tiles are
+held in memory and streamed to the GPU; they are never written to disk.
 
 ## Build
 
 Virchow is gated, so the build needs a Hugging Face account with access to
-[paige-ai/Virchow](https://huggingface.co/paige-ai/Virchow). The weights are pulled **at build
-time** into `$HF_HOME` inside the image; at runtime the container sets `HF_HUB_OFFLINE=1` and never
-talks to huggingface.co.
-
-The token is passed as a BuildKit secret, not a `--build-arg` — an ARG would stay readable in the
-image history:
+[paige-ai/Virchow](https://huggingface.co/paige-ai/Virchow). The weights are pulled into the image
+at build time, and the token is passed as a BuildKit secret (Docker 23+ uses BuildKit by default):
 
 ```bash
 HF_TOKEN=hf_xxx docker build --secret id=hf_token,env=HF_TOKEN -t virchow-embed embed/virchow
 ```
 
-The pinned stack is torch 2.13.0 / torchvision 0.28.0, in
-[`requirements.txt`](requirements.txt) — the default PyPI wheels are cu130 builds, so no separate
-index is needed. If the cluster needs a different CUDA build, install torch from
-`https://download.pytorch.org/whl/cuXXX` ahead of that file. timm is left unpinned so pip resolves
-it against the torch pin.
-
-slideflow and timm are installed with `--no-deps`, with slideflow's imports listed explicitly.
-slideflow's own dependency list is ~35 packages, most of which tiling never touches — a
-hyperparameter search stack (`smac` -> `pyrfr`, which needs swig to build on py>3.10), a GUI
-(`imgui`/`glfw`/`pyopengl`), umap/numba, tensorboard — and timm would otherwise pull a second copy
-of torch from PyPI.
-
-[`requirements-slideflow.txt`](requirements-slideflow.txt) holds slideflow's set and nothing else:
-the eager-import closure of `import slideflow` read off slideflow 3.0.2's source, plus `pyvips`,
-which slideflow only reaches lazily through its `sf.slide_backend()` dispatch. It has not been
-verified by an actual build. Two entries are load-bearing and easy to mistake for cruft: `rasterio`
-is imported at module level by `slide/wsi.py` and `slide/qc/otsu.py`, and `setuptools` is needed
-because `slideflow.plugin` imports `pkg_resources`, which Python 3.12 no longer bundles.
-
-[`requirements.txt`](requirements.txt) is separate and small: `torch` (pinned), `torchvision`,
-`timm` and `h5py`, installed normally so pip resolves timm and pulls its own deps. Keeping the two
-files apart means a slideflow bump only touches the file derived from slideflow, and it keeps the
-big torch layer from being refetched when the slideflow list changes.
-
-To catch what the closure missed, the build runs an import check (`import slideflow`, the vips
-backend, and `qc.Otsu()`) before pulling the weights, so a missing package fails the build instead
-of the cluster run. If it does fail, add the package to the list in the [`Dockerfile`](Dockerfile).
-Known lazy imports deliberately left out: `seaborn` (report plots), `crc32c` (tfrecord writing),
-`triangle`, `umap-learn`, `smac` — pin them back in if you take this image beyond tiling. Bumping
-slideflow means re-deriving the list.
+The running container never contacts huggingface.co.
 
 ## Run
 
@@ -70,83 +32,73 @@ docker run --rm --gpus '"device=0"' \
 ```
 
 `--slide-dir` is searched recursively. Slides that already have an `.h5` in `--out-dir` are skipped
-unless `--overwrite` is passed, so a killed job can be restarted; output is written to a hidden temp
-file and renamed, so a partial file never looks finished. A slide that fails is logged and the run
-moves on, with a non-zero exit at the end.
+unless `--overwrite` is passed, so an interrupted run can simply be restarted. A slide that fails is
+logged and the run moves on, exiting non-zero at the end.
 
-There is no multi-GPU support inside the container by design. Run one container per GPU over
-disjoint input directories:
+`--max-tiles 256` caps the work per slide, for a quick check that the whole path works.
+
+### Multiple GPUs
+
+One container per GPU, over disjoint input directories:
 
 ```bash
 docker run --rm --gpus '"device=0"' -v /slides/part0:/slides:ro -v /out:/out virchow-embed --slide-dir /slides --out-dir /out &
 docker run --rm --gpus '"device=1"' -v /slides/part1:/slides:ro -v /out:/out virchow-embed --slide-dir /slides --out-dir /out &
 ```
 
-For a quick smoke test on the cluster, `--max-tiles 256` caps work per slide.
+### Apptainer
+
+```bash
+apptainer build virchow-embed.sif docker-daemon://virchow-embed:latest
+apptainer run --nv -B /path/to/slides:/slides,/path/to/out:/out virchow-embed.sif \
+  --slide-dir /slides --out-dir /out
+```
 
 ### Flags
 
-| flag                 | default            | what it does                                          |
-| -------------------- | ------------------ | ----------------------------------------------------- |
-| `--slide-dir`        | required           | directory of WSIs, searched recursively                |
-| `--out-dir`          | required           | where the per-slide `.h5` files go                     |
-| `--thumbnail-dir`    | `<out-dir>/thumbnails` | where the masked thumbnails go                    |
+| flag                 | default                | what it does                             |
+| -------------------- | ---------------------- | ---------------------------------------- |
+| `--slide-dir`        | required               | directory of WSIs, searched recursively  |
+| `--out-dir`          | required               | where the per-slide `.h5` files go       |
+| `--thumbnail-dir`    | `<out-dir>/thumbnails` | where the masked thumbnails go           |
 | `--ext`              | `.svs .tif .tiff .ndpi .scn .mrxs .bif .svslide` | slide extensions to look for |
-| `--batch-size`       | 64                 | tiles per forward pass                                 |
-| `--num-tile-readers` | 8                  | worker processes decoding tiles                        |
-| `--queue-depth`      | 8                  | tile batches buffered ahead of the GPU                 |
-| `--precision`        | `fp16`             | autocast dtype (`fp16`/`bf16`/`fp32`)                  |
-| `--gzip-level`       | 4                  | `features` compression; 0 disables                     |
-| `--thumbnail-width`  | 2048               | masked thumbnail width in px                           |
-| `--max-tiles`        | 0 (all)            | cap tiles per slide, for smoke tests                   |
-| `--overwrite`        | off                | re-embed slides that already have an `.h5`             |
+| `--batch-size`       | 64                     | tiles per forward pass                   |
+| `--num-tile-readers` | 8                      | worker processes decoding tiles          |
+| `--queue-depth`      | 8                      | tile batches buffered ahead of the GPU   |
+| `--device`           | `cuda` if available    | torch device to embed on                 |
+| `--gzip-level`       | 4                      | `features` compression; 0 disables       |
+| `--thumbnail-width`  | 2048                   | masked thumbnail width in px             |
+| `--max-tiles`        | 0 (all)                | cap tiles per slide                      |
+| `--overwrite`        | off                    | re-embed slides that already have an `.h5` |
+| `--log-every`        | 50                     | log progress every N batches             |
 
-Nothing here is tuned. Reading tiles is usually the bottleneck before the GPU is, so
-`--num-tile-readers` and `--batch-size` are the first knobs to reach for.
-
-fp16 autocast is what the Virchow model card prescribes; embeddings still come out fp32 because the
-model's final op is a LayerNorm that runs in mixed precision.
+Reading tiles is usually the bottleneck before the GPU is, so `--num-tile-readers` and
+`--batch-size` are the first knobs to reach for.
 
 ## Output
 
-`<out-dir>/<slide>.h5`, row-aligned so that `features[i]` belongs to the tile at `grid[i]`/`loc[i]`:
+`<out-dir>/<slide>.h5` holds three row-aligned datasets, so that `features[i]` is the embedding of
+the tile at `grid[i]` / `loc[i]`:
 
-| dataset    | shape       | dtype     | notes                                        |
-| ---------- | ----------- | --------- | -------------------------------------------- |
-| `features` | `(N, 2560)` | `float32` | gzip compressed, written incrementally       |
-| `grid`     | `(N, 2)`    | `int32`   | tile grid indices                            |
-| `loc`      | `(N, 2)`    | `int32`   | base-level pixel coords (`-1` if unavailable)|
+| dataset    | shape       | dtype     | notes                                  |
+| ---------- | ----------- | --------- | -------------------------------------- |
+| `features` | `(N, 2560)` | `float32` | gzip compressed                        |
+| `grid`     | `(N, 2)`    | `int32`   | tile grid indices                      |
+| `loc`      | `(N, 2)`    | `int32`   | base-level pixel coordinates           |
 
-`N` is the number of tiles that passed Otsu tissue filtering, so it is smaller than the full tile
-grid and varies by slide.
+`N` is the number of tiles that passed tissue filtering, so it is smaller than the full tile grid
+and varies by slide. Embeddings are fp32: inference runs under fp16 autocast, but Virchow's final
+op is a LayerNorm that runs in mixed precision.
 
-Root attributes carry the provenance needed to interpret the file later: `slide`, `slide_path`,
-`encoder`, `encoder_source`, `embed_dim`, `n_tiles`, `tile_px`, `tile_um`, `stride_div`, `qc`,
-`precision`, `mpp`, `slide_dimensions`, `grid_shape`, `thumbnail`, `created_utc`, `torch_version`,
+Root attributes record how the file was produced: `slide`, `slide_path`, `encoder`,
+`encoder_source`, `embed_dim`, `n_tiles`, `tile_px`, `tile_um`, `stride_div`, `qc`, `precision`,
+`mpp`, `slide_dimensions`, `grid_shape`, `thumbnail`, `created_utc`, `torch_version`,
 `slideflow_version`.
-
-`<out-dir>/thumbnails/<slide>.png` is the slide thumbnail with everything Otsu rejected dimmed and
-tinted, for eyeballing tissue detection across a cohort.
 
 ## Files
 
 * [`Dockerfile`](Dockerfile) — image, including the build-time weight pull
-* [`requirements-slideflow.txt`](requirements-slideflow.txt) — slideflow's minimal import set
 * [`requirements.txt`](requirements.txt) — torch (pinned), timm, and our own deps
-* [`virchow.py`](virchow.py) — the model wrapper (normalization + cls/patch-mean concat baked in)
-* [`download_model.py`](download_model.py) — build-time fetch and CPU smoke test
-* [`embed_wsi.py`](embed_wsi.py) — the CLI that walks a slide directory
-
-## Notes for the first cluster run
-
-* Untested end to end — this machine has no GPU, no slides, and no room to build the image.
-* If slideflow's tile dicts turn out not to carry `loc`, the run logs a warning per slide and `loc`
-  is filled with `-1`; the grid indices are unaffected.
-* Under Apptainer, `$HOME` is often read-only or remapped; `HF_HOME`, `MPLCONFIGDIR` and
-  `NUMBA_CACHE_DIR` are all set to writable paths in the image for that reason:
-
-    ```bash
-    apptainer build virchow-embed.sif docker-daemon://virchow-embed:latest
-    apptainer run --nv -B /path/to/slides:/slides,/path/to/out:/out virchow-embed.sif \
-      --slide-dir /slides --out-dir /out
-    ```
+* [`requirements-slideflow.txt`](requirements-slideflow.txt) — slideflow's minimal import set
+* [`src/virchow.py`](src/virchow.py) — the model wrapper
+* [`src/embed_wsi.py`](src/embed_wsi.py) — the CLI that walks a slide directory
