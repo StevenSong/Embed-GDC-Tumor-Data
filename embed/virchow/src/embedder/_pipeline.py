@@ -1,4 +1,7 @@
+import contextlib
+import io
 import os
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -80,11 +83,22 @@ def compile_model(
     warm = torch.zeros(
         (batch_size, TILE_PX, TILE_PX, 3), dtype=torch.uint8, device=device
     ).permute(0, 3, 1, 2)
-    with (
-        torch.inference_mode(),
-        torch.autocast(device_type=device.type, dtype=PRECISION),
-    ):
-        model(warm)
+    # inductor writes its autotune tables and choice stats straight to
+    # sys.stderr rather than through logging, so there is no logger to quiet --
+    # capture the stream instead. On a cold TORCHINDUCTOR_CACHE_DIR that is ~50
+    # lines of kernel timings nobody reads. Held rather than dropped, and
+    # replayed if the warmup fails, when it is the only context there is
+    captured = io.StringIO()
+    try:
+        with (
+            contextlib.redirect_stderr(captured),
+            torch.inference_mode(),
+            torch.autocast(device_type=device.type, dtype=PRECISION),
+        ):
+            model(warm)
+    except BaseException:
+        sys.stderr.write(captured.getvalue())
+        raise
 
     logger.info("compiled in %.1fs", time.time() - start)
     return model
