@@ -1,4 +1,4 @@
-# Direct dependencies of embed_wsi.py and the model wrapper.
+# Direct dependencies of the embedder package and the model wrapper.
 #
 # torch is pinned because the CUDA build matters and the default PyPI wheels are
 # built against CUDA 13.0. For a different CUDA build, install torch/torchvision
@@ -7,10 +7,12 @@
 # timm is deliberately unpinned: pip picks a version that agrees with the torch pin
 # and pulls timm's own deps (pyyaml, huggingface_hub, safetensors) along with it.
 #
-# numpy and pillow are used here too, but come from requirements-slideflow.txt.
 
 h5py                    # per-slide HDF5 output
-rich                    # colorized logging; slideflow's records route through it
+imagecodecs             # tifffile's JPEG / JPEG 2000 decoders for Aperio segments
+opencv-python-headless  # tissue detection, tile resize, thumbnail encode
+rich                    # colorized logging
+tifffile                # reads the Aperio pyramid directly, see _reader.py
 timm                    # Virchow is a timm model: hf-hub:paige-ai/Virchow
 torch==2.13.0
 torchvision==0.28.0

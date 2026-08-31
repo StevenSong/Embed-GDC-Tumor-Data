@@ -4,11 +4,18 @@ Embeds whole-slide images with [Virchow](https://huggingface.co/paige-ai/Virchow
 container at a directory of WSIs and it writes, per slide:
 
 * `<out-dir>/embeddings/<slide>.h5` — one embedding per tile, with tile coordinates
-* `<out-dir>/thumbnails/<slide>.png` — the slide thumbnail with non-tissue dimmed out
+* `<out-dir>/thumbnails/<slide>.png` — the slide thumbnail with everything that was not
+  embedded dimmed out
 
-Slides are tiled with [slideflow](https://github.com/jamesdolezal/slideflow) into 224 px tiles at
-20x (0.5 MPP) under Otsu tissue detection, and each tile is embedded on the local GPU. Tiles are
-held in memory and streamed to the GPU; they are never written to disk.
+Slides are read directly off the Aperio pyramid with [tifffile](https://github.com/cgohlke/tifffile)
+(see `src/embedder/_reader.py`) and cut into 224 px tiles at 20x (0.5 MPP). Tissue detection follows
+CLAM (Lu et al., *Nat Biomed Eng* 2021) — HSV saturation, median blur, Otsu, morphological closing,
+then a contour filter with hole filling — and a tile is kept when its centre lands on tissue. Each
+tile is embedded on the local GPU; tiles are held in memory and streamed to the GPU, never written
+to disk.
+
+**Only Aperio-style tiled SVS pyramids are supported.** Striped TIFFs and other vendor formats
+(`.mrxs`, `.ndpi`, `.bif`) are rejected with `UnsupportedSlideError` rather than half-supported.
 
 ## Build
 
@@ -35,7 +42,9 @@ docker run -it --rm --gpus '"device=0"' \
 are skipped unless `--overwrite` is passed, so an interrupted run can simply be restarted. A slide
 that fails is logged and the run moves on, exiting non-zero at the end.
 
-`--max-tiles 256` caps the work per slide, for a quick check that the whole path works.
+Tiles are read by a `DataLoader` whose workers are separate processes, so the container needs
+`--shm-size` raised well above Docker's 64 MB default — roughly
+`batch-size × 224 × 224 × 3 B × prefetch-factor × num-tile-readers`, about 1.2 GB at the defaults.
 
 ### Flags
 
@@ -43,36 +52,40 @@ that fails is logged and the run moves on, exiting non-zero at the end.
 | -------------------- | ---------------------- | ---------------------------------------- |
 | `--slide-dir`        | `/slides`              | directory of WSIs, searched recursively  |
 | `--out-dir`          | `/out`                 | parent of `embeddings/` and `thumbnails/` |
-| `--exts`             | `.svs .tif .tiff .ndpi .scn .mrxs .bif .svslide` | slide extensions to look for |
-| `--batch-size`       | 64                     | tiles per forward pass                   |
-| `--num-tile-readers` | 8                      | worker processes reading tiles, per slide |
-| `--queue-depth`      | 8                      | tile batches buffered ahead of the GPU   |
-| `--stall-timeout`    | 600                    | fail a slide if no tiles arrive for this many seconds |
+| `--exts`             | `.svs`                 | slide extensions to look for             |
+| `--batch-size`       | 128                    | tiles per forward pass                   |
+| `--num-tile-readers` | 16                     | worker processes reading tiles; 0 reads inline |
+| `--prefetch-factor`  | 4                      | tile batches each reader buffers ahead of the GPU |
 | `--device`           | `cuda` if available    | torch device to embed on                 |
-| `--gzip-level`       | 4                      | `features` compression; 0 disables       |
 | `--thumbnail-width`  | 2048                   | masked thumbnail width in px             |
-| `--max-tiles`        | all                    | cap tiles per slide                      |
 | `--overwrite`        | off                    | re-embed slides that already have an `.h5` |
 
-Reading tiles is usually the bottleneck before the GPU is, so `--num-tile-readers` and
-`--batch-size` are the first knobs to reach for.
+`--num-tile-readers` and `--prefetch-factor` are the first knobs to reach for: the GPU should stay
+saturated, and if it does not, the readers are not keeping up.
 
 ## Output
 
 `<out-dir>/embeddings/<slide>.h5` holds three row-aligned datasets, so that `features[i]` is the
-embedding of the tile at `grid[i]` / `loc[i]`:
+embedding of the tile at `grid[i]` / `loc[i]`, plus a slide-level summary:
 
-| dataset    | shape       | dtype     | notes                                  |
-| ---------- | ----------- | --------- | -------------------------------------- |
-| `features` | `(N, 2560)` | `float32` | gzip compressed                        |
-| `grid`     | `(N, 2)`    | `int32`   | tile grid indices                      |
-| `loc`      | `(N, 2)`    | `int32`   | base-level pixel coordinates           |
+| dataset    | shape       | dtype     | notes                                        |
+| ---------- | ----------- | --------- | -------------------------------------------- |
+| `features` | `(N, 2560)` | `float32` | uncompressed                                 |
+| `grid`     | `(N, 2)`    | `int64`   | `(col, row)` in the full tile grid           |
+| `loc`      | `(N, 2)`    | `int64`   | base-level `(x, y)` of the tile's top-left   |
+| `mean`     | `(2560,)`   | `float32` | column average of `features`, the slide embedding |
+
+The two coordinate datasets are redundant by construction — `loc == grid * extract_px`, where
+`extract_px = round(tile_px * 0.5 / mpp)` is how many base-level pixels a tile covers — which makes
+a cheap integrity check on a finished file.
 
 `N` is the number of tiles that passed tissue filtering, so it is smaller than the full tile grid
 and varies by slide. Embeddings are fp32: inference runs under fp16 autocast, but Virchow's final
 op is a LayerNorm that runs in mixed precision.
 
+The file is written to `.<slide>.h5.tmp` and renamed only once `mean` and the attributes are in
+place, so an interrupted run never leaves a plausible-looking `.h5` behind.
+
 Root attributes record how the file was produced: `slide`, `slide_path`, `encoder`,
-`encoder_source`, `embed_dim`, `n_tiles`, `tile_px`, `tile_um`, `stride_div`, `qc`, `precision`,
-`mpp`, `slide_dimensions`, `grid_shape`, `thumbnail`, `created_utc`, `torch_version`,
-`slideflow_version`.
+`encoder_source`, `embed_dim`, `n_tiles`, `tile_px`, `tile_um`, `qc`, `precision`, `mpp`,
+`slide_dimensions`, `grid_shape`, `thumbnail`, `created_utc`, `torch_version`.

@@ -44,10 +44,9 @@ class TileDataset(IterableDataset):
             )
         self.coords_buffer[:num_tiles] = torch.as_tensor(masked_coords)
         self._num_tiles.fill_(num_tiles)
-        slide_index = self._slide_to_index[
-            slide_path
-        ]  # @Claude, this is a little bit of indirection, is it easier to fill a str tensor?
-        self._curr_slide.fill_(slide_index)
+        # NOTE: the index, rather than the path itself, is what crosses to the workers.
+        # This is a small amount of indirection that simplifies the rest of the code base.
+        self._curr_slide.fill_(self._slide_to_index[slide_path])
 
     def __iter__(self):
         curr_slide, num_tiles = int(self._curr_slide), int(self._num_tiles)
