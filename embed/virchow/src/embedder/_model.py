@@ -15,6 +15,7 @@ from timm.layers.mlp import SwiGLUPacked
 HF_HUB_ID = "hf-hub:paige-ai/Virchow"
 TILE_PX = 224
 TILE_UM = 112  # Virchow works at 20x i.e. 0.5 MPP
+TARGET_MPP = TILE_UM / TILE_PX
 EMBED_DIM = 2560
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)

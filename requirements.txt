@@ -2,6 +2,7 @@ black
 detect-secrets
 h5py
 h5tree
+imagecodecs
 ipywidgets
 isort
 jupyterlab
@@ -12,7 +13,6 @@ pre-commit
 scikit-learn
 scipy
 seaborn
-slideflow
 statannotations
 statsmodels
 tableone
