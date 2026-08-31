@@ -5,7 +5,18 @@ CLAM-style tissue detection -- at 224 px / 20x, and Virchow runs in this process
 local GPU. Tiles live in memory and stream straight to the GPU -- the only things
 written to disk are the per-slide HDF5 and its thumbnail.
 
-    python embed_wsi.py --slide-dir /data/slides --out-dir /data/embeddings
+    python -m embedder --slide-dir /data/slides --out-dir /data/embeddings
+
+Two reader pools alternate: while slide N is on the GPU, a background thread runs
+slide N+1's setup (open, Otsu, grid, thumbnail) and fills the other pool, so the
+GPU never waits for a slide to start. That costs shared memory --
+`2 * num_tile_readers * prefetch_factor * batch_size * 150 KB`, about 10 GB at the
+defaults -- so run with `--shm-size=12g` or the readers die with a bus error.
+
+Virchow is always `torch.compile`d, with no eager path and no flag to turn it off
+-- an uncompiled run does the same work in 54h instead of 35h, so a compile that
+fails is fatal rather than something to shrug off. Triton needs a C compiler on
+PATH, which is why the image installs gcc.
 
 Placement across GPUs is the caller's job: run one container per GPU with
 CUDA_VISIBLE_DEVICES pointed at a disjoint --slide-dir.
@@ -13,8 +24,10 @@ CUDA_VISIBLE_DEVICES pointed at a disjoint --slide-dir.
 
 import sys
 from argparse import ArgumentParser
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -22,9 +35,60 @@ from tqdm import tqdm
 from ._dataset import TileDataset
 from ._logging import setup_logging
 from ._model import TARGET_MPP, TILE_PX, WrappedVirchow
-from ._pipeline import embed_slide
+from ._pipeline import compile_model, embed_slide, prepare_slide
 
 SLIDE_EXTS = [".svs"]
+# one pool feeds the GPU while the other fills for the next slide
+N_READER_POOLS = 2
+
+
+def make_reader_pool(
+    *,  # enforce kwargs
+    slide_paths: list[Path],
+    batch_size: int,
+    prefetch_factor: int,
+    num_tile_readers: int,
+) -> tuple[TileDataset, DataLoader]:
+    """A (dataset, loader) pair whose workers read one slide at a time.
+
+    The dataset yields whole pre-stacked batches, so the loader does no batching
+    of its own -- see `TileDataset` for why the shape stream has to be static.
+    Tile geometry comes from the model so the parent's Slide in `_pipeline` and
+    the workers' Slides can never disagree about the grid.
+
+    The workers are forked here, on an empty slide, rather than lazily on the
+    first real one. `main` calls this before the model exists, and a reader that
+    forks before CUDA is initialised inherits no CUDA state -- in particular none
+    of the CUDA graphs max-autotune captures, which a forked child cannot destroy
+    and warns about all the way out. It also keeps Virchow's weights out of every
+    worker's page tables.
+    """
+    dataset = TileDataset(
+        slide_paths=slide_paths,
+        tile_px=TILE_PX,
+        target_mpp=TARGET_MPP,
+        batch_size=batch_size,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=None,  # the dataset batches; see TileDataset
+        drop_last=False,
+        num_workers=num_tile_readers,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=prefetch_factor,
+    )
+
+    # get the persistent dataloader workers spun up by faking a slide with no tiles
+    dataset.set_next_slide_tiles(
+        slide_path=slide_paths[0],
+        masked_coords=np.empty((0, 2), dtype=np.int32),
+    )
+    for _ in loader:
+        # should not yield anything, error if it does
+        raise AssertionError("empty slide yielded a batch")
+
+    return dataset, loader
 
 
 def main(args):
@@ -45,67 +109,110 @@ def main(args):
     thumb_dir.mkdir(parents=True, exist_ok=True)
     logger.info("found %d slides under %s", n_slides, args.slide_dir)
 
-    device = torch.device(args.device)
-    model = WrappedVirchow().eval().to(device)
-    logger.info("virchow ready on %s", device)
-
-    # special dataset with shared attributes to worker instances in dataloader.
-    # we treat each slide as an epoch and iterate over batches of tiles, so we end up with n_slides "epochs".
-    # tile geometry comes from the model so the parent's Slide in _pipeline and the
-    # workers' Slides can never disagree about the grid
-    tile_ds = TileDataset(
-        slide_paths=slide_paths,
-        tile_px=TILE_PX,
-        target_mpp=TARGET_MPP,
-    )
-    # persistent_workers/prefetch_factor are only meaningful with real workers, and
-    # DataLoader rejects them outright at num_workers=0
-    worker_opts = (
-        {"persistent_workers": True, "prefetch_factor": args.prefetch_factor}
-        if args.num_tile_readers > 0
-        else {}
-    )
-    tile_dl = DataLoader(
-        tile_ds,
-        batch_size=args.batch_size,
-        num_workers=args.num_tile_readers,
-        drop_last=False,  # NOTE: do not set this to True, will drop alot of tiles
-        pin_memory=args.device != "cpu",
-        **worker_opts,
-    )
-    failed = []
-    for i, slide_path in enumerate(
-        tqdm(slide_paths, desc="slides", unit="slide", position=0)
-    ):
-        # check if we should skip slide or not
+    # resolve skips up front: the prefetch below runs one slide ahead, and it can
+    # only do that against a list of slides it is actually going to embed
+    todo = []
+    for slide_path in slide_paths:
         out_path = embed_dir / f"{slide_path.stem}.h5"
         if out_path.exists() and not args.overwrite:
-            logger.info("[%d/%d] %s exists, skipping", i, n_slides, out_path.name)
+            logger.info("%s exists, skipping", out_path.name)
             continue
-        logger.info("[%d/%d] %s", i, n_slides, slide_path.name)
+        todo.append(slide_path)
+    if not todo:
+        logger.info("nothing to do: all %d slides already embedded", n_slides)
+        return 0
+    logger.info("embedding %d/%d slides", len(todo), n_slides)
 
-        try:
-            embed_slide(
-                logger=logger,
-                slide_path=slide_path,
-                thumbnail_path=thumb_dir / f"{slide_path.stem}.png",
-                thumbnail_width=args.thumbnail_width,
-                out_path=out_path,
-                tile_ds=tile_ds,
-                tile_dl=tile_dl,
-                model=model,
-                device=device,
-            )
-        except Exception:
-            logger.exception("failed to embed %s", slide_path.name)
-            failed.append(slide_path.name)
+    # NOTE: the reader pools are built first, and deliberately so -- they fork
+    # their workers, which must happen before the model initialises CUDA
+    if args.num_tile_readers <= 0:
+        raise ValueError(
+            f"Must specify non-zero positive number of tile readers, got {args.num_tile_readers}"
+        )
+    pools = [
+        make_reader_pool(
+            slide_paths=todo,
+            batch_size=args.batch_size,
+            num_tile_readers=args.num_tile_readers,
+            prefetch_factor=args.prefetch_factor,
+        )
+        for _ in range(N_READER_POOLS)
+    ]
+    logger.info(
+        "%d reader pools x %d workers ready", N_READER_POOLS, args.num_tile_readers
+    )
+
+    if not torch.cuda.is_available():
+        raise NotImplementedError("Non-cuda accelerator not supported")
+    device = torch.device("cuda")
+    model = WrappedVirchow().eval().to(device)
+    logger.info("virchow ready on %s", device)
+    model = compile_model(
+        logger=logger,
+        model=model,
+        batch_size=args.batch_size,
+        device=device,
+    )
+
+    # one thread, so preparations stay ordered and only ever one is in flight
+    prep_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="slide-prep")
+
+    def submit(i: int) -> Future | None:
+        """Start slide `i`'s setup and reader fill on the background thread."""
+        if i >= len(todo):
+            return None
+        # alternating pools: slide i+1 fills the pool slide i is not draining
+        tile_ds, tile_dl = pools[i % N_READER_POOLS]
+        return prep_pool.submit(
+            prepare_slide,
+            logger=logger,
+            slide_path=todo[i],
+            thumbnail_path=thumb_dir / f"{todo[i].stem}.png",
+            thumbnail_width=args.thumbnail_width,
+            out_path=embed_dir / f"{todo[i].stem}.h5",
+            tile_ds=tile_ds,
+            tile_dl=tile_dl,
+        )
+
+    failed = []
+    try:
+        pending = submit(0)
+        for i, slide_path in enumerate(
+            tqdm(todo, desc="slides", unit="slide", position=0)
+        ):
+            logger.info("[%d/%d] %s", i + 1, len(todo), slide_path.name)
+            # queue the next slide *before* blocking on this one, so its setup
+            # and pipeline fill overlap this slide's GPU time
+            this, pending = pending, submit(i + 1)
+            assert this is not None
+
+            try:
+                prep = this.result()
+            except Exception:
+                logger.exception("failed to prepare %s", slide_path.name)
+                failed.append(slide_path.name)
+                continue
+
+            try:
+                embed_slide(
+                    logger=logger,
+                    prep=prep,
+                    batch_size=args.batch_size,
+                    model=model,
+                    device=device,
+                )
+            except Exception:
+                logger.exception("failed to embed %s", slide_path.name)
+                failed.append(slide_path.name)
+    finally:
+        prep_pool.shutdown(wait=True)
 
     if failed:
         logger.error(
-            "%d/%d slides failed: %s", len(failed), n_slides, ", ".join(failed)
+            "%d/%d slides failed: %s", len(failed), len(todo), ", ".join(failed)
         )
         return 1
-    logger.info("done: %d slides", n_slides)
+    logger.info("done: %d slides", len(todo))
     return 0
 
 
@@ -132,24 +239,21 @@ if __name__ == "__main__":
     p.add_argument(
         "--batch-size",
         type=int,
-        default=128,
+        default=512,
         help="tiles to embed per forward pass",
     )
     p.add_argument(
         "--num-tile-readers",
         type=int,
-        default=16,
-        help="worker processes reading tiles; set to 0 to instead read on the main process",
+        default=32,
+        help="worker processes reading tiles, per pool; there are two pools, so"
+        " this many again are alive prefetching the next slide",
     )
     p.add_argument(
         "--prefetch-factor",
         type=int,
-        default=4,
+        default=2,
         help="tile batches each reader buffers ahead of the GPU",
-    )
-    p.add_argument(
-        "--device",
-        default="cuda" if torch.cuda.is_available() else "cpu",
     )
     p.add_argument(
         "--thumbnail-width",

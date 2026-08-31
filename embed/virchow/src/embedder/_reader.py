@@ -55,17 +55,56 @@ MAX_HOLES_PER_CONTOUR = 8
 # all a row-major scan ever needs live at once
 SEGMENT_CACHE_MB = 96
 
+# a whole pyramid level is only materialised with `asarray` below this many
+# decoded RGB bytes; past it the level is streamed segment by segment straight
+# into the reduced output. Comfortably above the ~250 MB the 64x level of the
+# biggest ordinary slide needs, and far below the 173 GB base level of the
+# worst single-level file in TCGA
+LEVEL_BYTE_BUDGET = 2 * 1024**3
+
+# Aperio's nominal scanner magnifications, used only when MPP is missing
+APPMAG_TO_MPP = {40.0: 0.25, 20.0: 0.5}
+# below this the file is a macro/label image or a reduced export, not a
+# diagnostic slide: real slides in TCGA have a median max dimension of ~99,600,
+# while the MPP-less files cluster at 1600 px and a 10,000 px export cap.
+# Guessing a magnification for those would embed them at a fabricated scale,
+# which is worse than failing
+MIN_DIAGNOSTIC_PX = 20000
+
 
 class UnsupportedSlideError(ValueError):
     """Slide is not a tiled Aperio-style pyramid we can read."""
 
 
-def _parse_mpp(description: str) -> float:
-    """Microns per pixel from the Aperio header in the base page's description."""
+def _resolve_mpp(description: str, dimensions: tuple[int, int]) -> tuple[float, str]:
+    """(microns per pixel, where it came from) for the base page.
+
+    The Aperio header's own `MPP` is authoritative. 97 of the 11,684 TCGA
+    diagnostic files carry a truncated header with no `MPP` at all; the 11 of
+    those that are full-size slides declare `AppMag`, which maps to MPP by
+    Aperio's nominal scale. The rest have nothing to go on and are rejected.
+    """
     match = re.search(r"\|\s*MPP\s*=\s*([0-9.]+)", description)
+    if match is not None:
+        return float(match.group(1)), "header"
+
+    if max(dimensions) < MIN_DIAGNOSTIC_PX:
+        raise UnsupportedSlideError(
+            f"no MPP in the Aperio image description, and {dimensions[0]}x"
+            f"{dimensions[1]} is too small to be a diagnostic slide"
+        )
+    match = re.search(r"\|\s*AppMag\s*=\s*([0-9.]+)", description)
     if match is None:
-        raise UnsupportedSlideError("no MPP in the Aperio image description")
-    return float(match.group(1))
+        raise UnsupportedSlideError(
+            "no MPP and no AppMag in the Aperio image description"
+        )
+    mpp = APPMAG_TO_MPP.get(float(match.group(1)))
+    if mpp is None:
+        raise UnsupportedSlideError(
+            f"no MPP in the Aperio image description, and AppMag="
+            f"{match.group(1)} is not a magnification we map"
+        )
+    return mpp, f"AppMag={match.group(1)}"
 
 
 class _SegmentCache:
@@ -158,8 +197,8 @@ class Slide:
                 f"{self.path}: {page.bitspersample} bits/sample, expected 8"
             )
 
-        self.mpp = _parse_mpp(page.description)
         self.dimensions = (int(page.imagewidth), int(page.imagelength))  # (x, y)
+        self.mpp, self.mpp_source = _resolve_mpp(page.description, self.dimensions)
 
         # base-level pixels per tile: ~440-490 on the 40x majority, but down to
         # tile_px itself on the 20x tail, so read_region resizes in either
@@ -175,7 +214,8 @@ class Slide:
         self._fh = open(self.path, "rb")
         self._cache = _SegmentCache(segment_cache_mb * 1024 * 1024)
 
-        self._seg_level = self._pick_seg_level()
+        self._mosaic: tuple[int, np.ndarray | None] = (-1, None)
+        self._seg_level, self._seg_shape = self._pick_seg_level()
         self._tissue_mask: np.ndarray | None = None
         self._coords: np.ndarray | None = None
         if coords is not None:
@@ -183,18 +223,102 @@ class Slide:
 
     # ------------------------------------------------------------------ levels
 
-    def _pick_seg_level(self) -> int:
-        """Pyramid level nearest SEG_DOWNSAMPLE, for tissue detection."""
-        downsamples = [self.dimensions[0] / level.shape[1] for level in self._levels]
-        return int(np.argmin([abs(d - SEG_DOWNSAMPLE) for d in downsamples]))
+    def _level_hw(self, level: int) -> tuple[int, int]:
+        """(height, width) of pyramid level `level`."""
+        page = self._levels[level].keyframe
+        return int(page.imagelength), int(page.imagewidth)
+
+    def _pick_seg_level(self) -> tuple[int, tuple[int, int]]:
+        """(level, (H, W)) to run tissue detection on.
+
+        Normally the pyramid level nearest SEG_DOWNSAMPLE, read whole. 107 TCGA
+        slides have <= 2 levels and 27 have only one, so "nearest 64x" is level 0
+        and reading it whole would decode the entire base image -- up to 173 GB
+        of RGB. Those get the same level streamed down to ~SEG_DOWNSAMPLE
+        instead, which holds one segment at a time.
+        """
+        downsamples = [
+            self.dimensions[0] / self._level_hw(i)[1] for i in range(len(self._levels))
+        ]
+        level = int(np.argmin([abs(d - SEG_DOWNSAMPLE) for d in downsamples]))
+
+        height, width = self._level_hw(level)
+        if height * width * 3 <= LEVEL_BYTE_BUDGET:
+            return level, (height, width)
+        out_w = max(1, round(self.dimensions[0] / SEG_DOWNSAMPLE))
+        return level, (max(1, round(height * out_w / width)), out_w)
 
     @property
     def seg_downsample(self) -> float:
-        return self.dimensions[0] / self._levels[self._seg_level].shape[1]
+        return self.dimensions[0] / self._seg_shape[1]
 
     def level_image(self, level: int) -> np.ndarray:
         """Whole pyramid level as (H, W, 3) uint8 RGB."""
         return np.asarray(self._levels[level].asarray())
+
+    def _level_array(self, level: int, out_h: int, out_w: int) -> np.ndarray:
+        """Pyramid level `level` as (out_h, out_w, 3) uint8 RGB."""
+        height, width = self._level_hw(level)
+        page = self._levels[level].keyframe
+        # the ordinary path, untouched: decode the level whole (tifffile does it
+        # with an internal thread pool) and resize once
+        if height * width * 3 <= LEVEL_BYTE_BUDGET or not page.is_tiled:
+            img = self.level_image(level)
+            if img.shape[:2] == (out_h, out_w):
+                return img
+            return cv2.resize(img, (out_w, out_h), interpolation=cv2.INTER_AREA)
+
+        # a streamed pass over an over-budget level is expensive, and tissue
+        # detection and the thumbnail both want the same one -- so keep the
+        # reduced result (tens of MB) and resize it down for the second caller
+        cached_level, cached = self._mosaic
+        if cached is not None and cached_level == level and cached.shape[1] >= out_w:
+            if cached.shape[:2] == (out_h, out_w):
+                return cached
+            return cv2.resize(cached, (out_w, out_h), interpolation=cv2.INTER_AREA)
+
+        img = self._level_mosaic(level, out_h, out_w)
+        self._mosaic = (level, img)
+        return img
+
+    def _level_mosaic(self, level: int, out_h: int, out_w: int) -> np.ndarray:
+        """Reduce a pyramid level segment by segment, never holding it whole.
+
+        Peak memory is one decoded segment plus the output, so the 212906x271605
+        single-level slides cost ~42 MB instead of 173 GB. Edge segments are
+        *cropped* to the image before scaling -- they are padded out to a full
+        tile in the file, and squeezing that padding in gives a plausible-looking
+        but wrong mask.
+        """
+        page = self._levels[level].keyframe
+        height, width = self._level_hw(level)
+        tile_h, tile_w = int(page.tilelength), int(page.tilewidth)
+        cols = -(-width // tile_w)
+        jpegtables = page.jpegtables
+
+        # sparse segments stay at zero, matching what `_segment` decodes them to
+        canvas = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+        for row in range(-(-height // tile_h)):
+            y0, y1 = row * tile_h, min((row + 1) * tile_h, height)
+            dy0, dy1 = round(y0 * out_h / height), round(y1 * out_h / height)
+            if dy1 <= dy0:
+                continue
+            for col in range(cols):
+                x0, x1 = col * tile_w, min((col + 1) * tile_w, width)
+                dx0, dx1 = round(x0 * out_w / width), round(x1 * out_w / width)
+                if dx1 <= dx0:
+                    continue
+                segment = self._decode_segment(page, row * cols + col, jpegtables)
+                if segment is None:
+                    continue
+                segment = segment[: y1 - y0, : x1 - x0]
+                if segment.shape[:2] == (dy1 - dy0, dx1 - dx0):
+                    canvas[dy0:dy1, dx0:dx1] = segment
+                else:
+                    canvas[dy0:dy1, dx0:dx1] = cv2.resize(
+                        segment, (dx1 - dx0, dy1 - dy0), interpolation=cv2.INTER_AREA
+                    )
+        return canvas
 
     def thumbnail(self, width: int = 2048) -> np.ndarray:
         """Downsampled whole-slide image, `width` px across."""
@@ -207,12 +331,13 @@ class Slide:
                 f"thumbnail width {width} exceeds slide width {self.dimensions[0]}"
             )
         level = max(
-            (i for i, lv in enumerate(self._levels) if lv.shape[1] >= width),
+            (i for i in range(len(self._levels)) if self._level_hw(i)[1] >= width),
             default=0,
         )
-        img = self.level_image(level)
-        height = max(1, round(img.shape[0] * width / img.shape[1]))
-        return cv2.resize(img, (width, height), interpolation=cv2.INTER_AREA)
+        height, level_width = self._level_hw(level)
+        return self._level_array(
+            level, max(1, round(height * width / level_width)), width
+        )
 
     # ------------------------------------------------------- tissue detection
 
@@ -224,7 +349,7 @@ class Slide:
         return self._tissue_mask
 
     def _segment_tissue(self) -> np.ndarray:
-        img = self.level_image(self._seg_level)
+        img = self._level_array(self._seg_level, *self._seg_shape)
 
         # saturation separates stained tissue from the white/grey background far
         # better than luminance; blur first so Otsu is not led by JPEG speckle
@@ -356,25 +481,32 @@ class Slide:
             region, (self.tile_px, self.tile_px), interpolation=interpolation
         )
 
+    def _decode_segment(self, page, key: int, jpegtables) -> np.ndarray | None:
+        """Segment `key` of `page` as (tile_h, tile_w, 3) uint8, None if sparse."""
+        count = page.databytecounts[key]
+        if count == 0:  # sparse segment: Aperio writes nothing for blank tiles
+            return None
+        self._fh.seek(page.dataoffsets[key])
+        data = self._fh.read(count)
+        # tifffile owns the Aperio quirks: abbreviated JPEG streams need the
+        # page's shared tables, and 33003 carries an undeclared YCbCr transform
+        # that a raw jpeg2k decode gets wrong
+        decoded, _, _ = page.decode(data, key, jpegtables=jpegtables)
+        # decode returns a leading sample axis; the shape is guaranteed by the
+        # photometric/samplesperpixel checks in __init__, so reshape strictly
+        return np.asarray(decoded).reshape(
+            int(page.tilelength), int(page.tilewidth), 3
+        )
+
     def _segment(self, key: int) -> np.ndarray:
-        """Decoded (tile_h, tile_w, 3) segment `key`, from cache when possible."""
+        """Decoded (tile_h, tile_w, 3) base segment `key`, from cache when possible."""
         segment = self._cache.get(key)
         if segment is not None:
             return segment
 
-        count = self._page.databytecounts[key]
-        if count == 0:  # sparse segment: Aperio writes nothing for blank tiles
+        segment = self._decode_segment(self._page, key, self._jpegtables)
+        if segment is None:
             segment = np.zeros((self._tile_h, self._tile_w, 3), dtype=np.uint8)
-        else:
-            self._fh.seek(self._page.dataoffsets[key])
-            data = self._fh.read(count)
-            # tifffile owns the Aperio quirks: abbreviated JPEG streams need the
-            # page's shared tables, and 33003 carries an undeclared YCbCr
-            # transform that a raw jpeg2k decode gets wrong
-            decoded, _, _ = self._page.decode(data, key, jpegtables=self._jpegtables)
-            # decode returns a leading sample axis; the shape is guaranteed by the
-            # photometric/samplesperpixel checks in __init__, so reshape strictly
-            segment = np.asarray(decoded).reshape(self._tile_h, self._tile_w, 3)
 
         self._cache.put(key, segment)
         return segment
@@ -387,6 +519,7 @@ class Slide:
     # ----------------------------------------------------------------- cleanup
 
     def close(self):
+        self._mosaic = (-1, None)
         self._cache.clear()
         self._fh.close()
         self._tif.close()

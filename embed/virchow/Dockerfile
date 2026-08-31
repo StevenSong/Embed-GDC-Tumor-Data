@@ -6,6 +6,11 @@
 ARG BASE_IMAGE=python:3.12-slim
 FROM ${BASE_IMAGE}
 
+# C compiler for torch.compile to build Triton's kernels
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gcc libc6-dev \
+ && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
