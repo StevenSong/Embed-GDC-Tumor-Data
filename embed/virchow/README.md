@@ -40,6 +40,12 @@ about half again the time, so a compile that fails is fatal rather than somethin
 — silently taking 54 h over a corpus that should take 35 h is the worse outcome. Triton needs a C
 compiler on `PATH`, which is why the image installs `gcc`.
 
+> **Triton here means the kernel language**, [triton-lang/triton](https://github.com/triton-lang/triton),
+> the compiler backend TorchInductor emits GPU kernels in — *not*
+> [Triton Inference Server](https://github.com/triton-inference-server/server), which is the
+> NVIDIA model server used over in [kserve-demo/](../../kserve-demo). Two unrelated projects, same
+> name. Nothing is served here; the model is compiled in-process.
+
 ### Slides that need special handling
 
 Two classes of file in TCGA break a naive reader, and both are handled in `_reader.py`:

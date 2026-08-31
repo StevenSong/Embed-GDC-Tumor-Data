@@ -26,6 +26,12 @@ The two containers mirror the two halves of a KServe `InferenceService`:
 * **triton** — [Triton Inference Server](https://github.com/triton-inference-server/server) serving
   Virchow as a TorchScript model ([`model-repo/virchow/config.pbtxt`](model-repo/virchow/config.pbtxt)).
 
+> **Triton here means NVIDIA's model server**, not
+> [triton-lang/triton](https://github.com/triton-lang/triton), the GPU kernel language
+> `torch.compile` generates code in. The batch pipeline in
+> [embed/virchow/](../embed/virchow) uses that other Triton and no server at all. Two unrelated
+> projects, same name.
+
 Normalization and Virchow's embedding step (concat of the class token with the mean of the patch
 tokens) are baked into the serialized model, so the wire format between the two containers is
 `uint8` tiles in, `(B, 2560)` `float32` embeddings out. See
