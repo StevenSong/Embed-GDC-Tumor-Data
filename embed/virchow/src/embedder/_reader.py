@@ -182,10 +182,21 @@ class Slide:
             )
         # asserted once here so every read below can assume (h, w, 3) uint8 and
         # index rather than reshape defensively; a CMYK or 16-bit page would
-        # otherwise sail through and come out as plausible-looking garbage
-        if page.photometric != tifffile.PHOTOMETRIC.RGB:
+        # otherwise sail through and come out as plausible-looking garbage.
+        # YCbCr is allowed for baseline JPEG only: the JPEG decoder converts to
+        # RGB on its way out (verified bit-identical to PIL on the one corpus
+        # slide that declares it, a GT450 "JPEG/YCC" scan), whereas a YCbCr page
+        # under any other codec would hand back raw, possibly subsampled chroma.
+        # This is unrelated to 33003's *undeclared* transform, which tifffile
+        # applies internally on pages that already tag themselves RGB.
+        if page.photometric == tifffile.PHOTOMETRIC.YCBCR:
+            photometric_ok = page.compression == JPEG
+        else:
+            photometric_ok = page.photometric == tifffile.PHOTOMETRIC.RGB
+        if not photometric_ok:
             raise UnsupportedSlideError(
-                f"{self.path}: photometric {page.photometric!r}, expected RGB"
+                f"{self.path}: photometric {page.photometric!r} under compression"
+                f" {page.compression!r}, expected RGB"
             )
         if page.samplesperpixel != 3 or page.extrasamples:
             raise UnsupportedSlideError(
