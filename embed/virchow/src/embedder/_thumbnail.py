@@ -20,7 +20,8 @@ def save_masked_thumbnail(
 
     The kept set is `slide.coords`, not the raw tissue mask, so a single image
     shows every reason a region is missing from the .h5: the Otsu rejection, the
-    centre-on-tissue rule, and the partial tiles dropped at the right/bottom edge.
+    area floor, the occupancy threshold, the per-tile glass gate, and the partial
+    tiles dropped at the right/bottom edge.
     """
     # thumbnail() refuses to upsample, and a slide narrower than `width` is not
     # worth failing a run over

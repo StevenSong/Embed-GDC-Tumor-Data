@@ -5,6 +5,14 @@ import numpy as np
 
 H5_CHUNK_ROWS = 256
 
+# Storage dtype for `features`. Virchow runs under fp16 autocast and only its
+# final LayerNorm is mixed-precision, so fp32 storage was recording precision
+# the model never produced -- at 2x the bytes. The corpus is ~184M tiles of 2560
+# floats, which is 1.9 TB at fp32 against 0.94 TB here. `mean` is accumulated in
+# float64 from the full-precision batch before this cast, so the slide-level
+# vector does not inherit the storage precision.
+FEATURE_DTYPE = np.float16
+
 
 class SlideH5:
     """Streaming writer: embeddings are appended per batch, never held in full."""
@@ -21,7 +29,7 @@ class SlideH5:
             shape=(0, embed_dim),
             maxshape=(None, embed_dim),
             chunks=(H5_CHUNK_ROWS, embed_dim),
-            dtype=np.float32,  # virchow embedding type
+            dtype=FEATURE_DTYPE,
             **compression,
         )
         self.grid = self._coords("grid")
@@ -37,7 +45,8 @@ class SlideH5:
             shape=(0, 2),
             maxshape=(None, 2),
             chunks=(4096, 2),
-            dtype=int,
+            # int32 is ample: base-level coordinates top out around 3e5
+            dtype=np.int32,
         )
 
     def append(
@@ -59,9 +68,16 @@ class SlideH5:
         self.total += features.sum(axis=0, dtype=np.float64)
 
     def write_mean(self):
-        """Global average embedding over every tile in the slide."""
-        mean = self.total / self.n if self.n else np.full_like(self.total, np.nan)
-        self.f.create_dataset("mean", data=mean.astype(np.float32))
+        """Global average embedding over every tile in the slide.
+
+        A tile-less slide used to get a NaN mean here. It now raises: the caller
+        is expected to have failed the slide long before this point (see
+        `NoTissueError`), and silently emitting a vector that looks valid is the
+        one outcome worth ruling out twice.
+        """
+        if not self.n:
+            raise ValueError("no tiles were appended, so there is no mean to write")
+        self.f.create_dataset("mean", data=(self.total / self.n).astype(np.float32))
 
     def write_metadata(self, meta: dict):
         for key, value in meta.items():

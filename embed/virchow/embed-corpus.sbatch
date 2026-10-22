@@ -11,6 +11,16 @@
 #   OUT_DIR=/path/to/output/embeddings \
 #     sbatch embed/virchow/embed-corpus.sbatch
 #
+# To spread the corpus over several GPUs, submit one job per shard against the
+# same SLIDE_DIR and OUT_DIR. Each job takes every Nth slide and skips anything
+# already embedded, so the shards never collide and any one of them can be
+# resubmitted on its own:
+#
+#   for i in 0 1 2 3; do
+#     SLIDE_DIR=... OUT_DIR=... SHARD=$i SHARDS=4 \
+#       sbatch embed/virchow/embed-corpus.sbatch
+#   done
+#
 set -euo pipefail
 
 # Required
@@ -19,7 +29,12 @@ OUT_DIR=${OUT_DIR:?set OUT_DIR to the directory to write embeddings into}
 
 # Optional
 IMAGE=${IMAGE:-virchow-embedder:latest}
-SHM_SIZE=${SHM_SIZE:-16g}
+# 64g not because the working set needs it -- that is ~10 GB -- but because a
+# tmpfs that merely runs tight silently collapses reader throughput 3-6x on
+# large slides. See the throughput note in README.md.
+SHM_SIZE=${SHM_SIZE:-64g}
+SHARD=${SHARD:-0}
+SHARDS=${SHARDS:-1}
 
 # Read from slurm reservation
 : "${CUDA_VISIBLE_DEVICES:?must specify GPU}"
@@ -33,13 +48,18 @@ NAME="virchow-embed-$SLURM_JOB_ID"
 cleanup() { docker stop -t 30 "$NAME" >/dev/null 2>&1 || true; }
 trap cleanup EXIT TERM INT
 
-echo "job $SLURM_JOB_ID on $(hostname), GPU $CUDA_VISIBLE_DEVICES, image $IMAGE"
+echo "job $SLURM_JOB_ID on $(hostname), GPU $CUDA_VISIBLE_DEVICES, image $IMAGE," \
+     "shard $SHARD/$SHARDS"
+# The source is baked into the image, so a stale build fails on new flags with an
+# argparse error that says nothing about staleness. Print what we are actually
+# running against so the log answers that question on its own.
+echo "image built $(docker image inspect -f '{{.Created}}' "$IMAGE" 2>/dev/null || echo UNKNOWN)"
 
 docker run --rm --name "$NAME" \
   --gpus "\"device=$CUDA_VISIBLE_DEVICES\"" \
   --shm-size="$SHM_SIZE" \
   -v "$SLIDE_DIR:/slides:ro" \
   -v "$OUT_DIR:/out" \
-  "$IMAGE" --slide-dir /slides --out-dir /out &
+  "$IMAGE" --slide-dir /slides --out-dir /out --shard "$SHARD" --shards "$SHARDS" &
 
 wait $!

@@ -6,9 +6,11 @@ streams that need the page's shared `jpegtables`) or Aperio JPEG 2000
 (compression 33003/33005, self-contained codestreams). Anything else -- striped
 TIFFs, .mrxs, .ndpi, .bif -- is rejected rather than half-supported.
 
-Tissue detection follows CLAM (Lu et al., Nat Biomed Eng 2021): HSV saturation,
-median blur, Otsu, morphological closing, then a contour filter with hole
-filling. A tile is kept when its centre falls on tissue.
+Tissue detection thresholds *darkness* -- inverted grayscale -- with Otsu, closes
+the result, and drops connected components below a physical area floor. A tile is
+kept when enough of its footprint lands on tissue. See `Slide._segment_tissue`
+for why darkness and not saturation, and `Slide._tissue_coords` for why occupancy
+and not the centre pixel.
 
 `Slide` is a sequence of tiles::
 
@@ -24,6 +26,7 @@ indices arrive in roughly ascending order -- see `Slide.cache_stats`.
 
 from __future__ import annotations
 
+import os
 import re
 from collections import OrderedDict
 from pathlib import Path
@@ -42,14 +45,80 @@ APERIO_JP2000_YCBC = 33003
 APERIO_JP2000_RGB = 33005
 SUPPORTED_COMPRESSION = (JPEG, APERIO_JP2000_YCBC, APERIO_JP2000_RGB)
 
-# CLAM segmentation defaults (CLAM/wsi_core/WholeSlideImage.py segmentTissue)
+# Tissue detection here is an original implementation, and it has to stay one.
+# The obvious references are all copyleft or non-commercial and cannot be
+# borrowed from, only read about: CLAM is GPL-3.0, TRIDENT is CC BY-NC-ND 4.0,
+# GrandQC is CC BY-NC-SA 4.0 (including its published TCGA masks), PathML is
+# GPL-2.0. What is usable if this ever needs a reference mask or a second
+# opinion: HistoQC (Clear BSD), LazySlide / slideflow / MONAI (MIT or
+# Apache-2.0), scikit-image and tifffile (BSD-3), OpenCV (Apache-2.0). TiaToolbox
+# is BSD-3 for code but licenses its weights separately. Algorithms are not
+# copyrightable and expression is, so work from a method description; do not
+# diff against an implementation.
+#
+# Approaches that were measured and failed, so they do not get re-derived:
+#
+#   * Colour correction / flat-fielding to fix false positives. The two worst
+#     false-positive slides have the *flattest* backgrounds in the corpus. There
+#     is no cast or gradient to correct; the signal is absent, not distorted.
+#   * Otsu's separability measure as a "no tissue" guard. Blank slides span
+#     0.45-0.91, fully overlapping good slides.
+#   * The absolute tissue-vs-background intensity gap as a guard. A confirmed
+#     false positive scores 0.114, above two slides with real tissue.
+#   * Structure-to-noise ratio (low-frequency range over high-frequency energy)
+#     as a guard. Clean on 12 slides, failed at corpus scale: the denominator
+#     measures texture, not noise, so busy well-stained slides score like blanks.
+#   * A per-tile mean-brightness band-pass as a secondary gate. See the note
+#     above `MIN_TILE_OCCUPANCY`.
+#
+# The upshot is that there is no working automated blank-slide guard, and the
+# corpus sweep bounds the damage at ~5 slides in 11,596. Hand-curate if it
+# matters; do not spend another pass looking for a statistic.
+
 SEG_DOWNSAMPLE = 64  # target downsample to segment at; nearest available is used
-MEDIAN_BLUR_PX = 7
-CLOSE_KERNEL_PX = 4
-REF_PATCH_PX = 512  # area unit the contour thresholds below are expressed in
-MIN_TISSUE_AREA = 100  # in ref-patch areas
-MIN_HOLE_AREA = 16  # in ref-patch areas
-MAX_HOLES_PER_CONTOUR = 8
+MEDIAN_BLUR_PX = 7  # kills JPEG speckle so Otsu is not led by it
+CLOSE_KERNEL_PX = 4  # bridges the gaps Otsu leaves inside a section
+
+# Smallest connected component that counts as specimen rather than dust, as a
+# physical area rather than a pixel count.
+#
+# The denomination is the point. A floor counted in pixels of the slide means a
+# different physical area on every scanner: the same 26.2 Mpx is 6.55 mm^2 at
+# 0.5 mpp but 0.32 mm^2 at 0.11, so a pixel floor punishes coarse scans for
+# their resolution. Measured over this corpus that was the dominant confound --
+# 20x slides are 9.3% of the slides but were 60.5% of the masks a pixel floor
+# emptied outright. This corpus spans 0.11-0.50 mpp, so the floor has to be
+# physical.
+#
+# The value has two orders of magnitude of headroom either side: components this
+# discards on ordinary slides run median 0.002 mm^2 and p99 0.275, while real
+# specimen fragments are 1-6.5 mm^2. Anchoring the equivalent pixel count at the
+# corpus-median 0.25 mpp is what fixes it here.
+ANCHOR_MPP = 0.25
+MIN_TISSUE_AREA_MM2 = 16 * (512 * ANCHOR_MPP / 1000) ** 2  # 0.262 mm^2
+
+# Fraction of a tile's footprint that must be tissue for the tile to be kept.
+#
+# The alternative -- keeping a tile when its centre pixel lands on tissue -- point
+# samples 1 of ~236 mask pixels at this corpus's geometry. It is unbiased but
+# high variance, and on lacy tissue which tiles it picks is close to a coin flip.
+# Occupancy costs almost nothing to raise recall with: measured over all 11,596
+# readable slides, dropping the threshold from 0.50 to 0.10 adds 6% more tiles
+# corpus-wide (173.1M -> 184.2M) while lifting the spatial coherence of the kept
+# set from 0.946 to 0.962. 0.10 is also what Prov-GigaPath uses.
+MIN_TILE_OCCUPANCY = 0.10
+
+# There is deliberately no per-tile brightness gate here, and this is the second
+# time that idea has been tried. As a *primary* detector -- keep a tile when
+# `0.20 <= mean(gray) <= background_mode - 0.05`, no mask involved -- it works,
+# because the brightness test is then doing all the work. Behind a mask it can
+# only subtract, and measured over 126 slides what it subtracts is tissue: the
+# median occupancy of a tile it dropped was 1.000, 55% of its drops were tiles
+# at least 90% covered in tissue, and on the pale slides this rewrite exists to
+# rescue it removed up to 98% of the output. Pale tissue sits within 0.05 of
+# glass by definition, so no choice of margin separates them. Occupancy already
+# guarantees a kept tile is at least `MIN_TILE_OCCUPANCY` tissue by the slide's
+# own Otsu threshold, which is the check the gate was standing in for.
 
 # decoded segments held per slide; ~2 segment rows of a 90k-wide slide, which is
 # all a row-major scan ever needs live at once
@@ -74,6 +143,15 @@ MIN_DIAGNOSTIC_PX = 20000
 
 class UnsupportedSlideError(ValueError):
     """Slide is not a tiled Aperio-style pyramid we can read."""
+
+
+class NoTissueError(ValueError):
+    """Tissue detection kept nothing, so there is no embedding to write.
+
+    Raised rather than written out: an .h5 with zero tiles and an all-NaN `mean`
+    looks like a valid row to everything downstream and poisons any average,
+    PCA or probe it reaches. A missing file is detectable; a NaN vector is not.
+    """
 
 
 def _resolve_mpp(description: str, dimensions: tuple[int, int]) -> tuple[float, str]:
@@ -162,11 +240,13 @@ class Slide:
         tile_px: int,
         target_mpp: float,
         coords: np.ndarray | None = None,
+        min_occupancy: float = MIN_TILE_OCCUPANCY,
         segment_cache_mb: int = SEGMENT_CACHE_MB,
     ):
         self.path = str(path)
         self.tile_px = tile_px
         self.target_mpp = target_mpp
+        self.min_occupancy = min_occupancy
 
         self._tif = tifffile.TiffFile(self.path)
         series = self._tif.series[0]  # "Baseline"; series[1] is Aperio's thumbnail
@@ -262,6 +342,11 @@ class Slide:
     @property
     def seg_downsample(self) -> float:
         return self.dimensions[0] / self._seg_shape[1]
+
+    @property
+    def seg_px_mm2(self) -> float:
+        """Area of one segmentation-level pixel, in mm^2."""
+        return (self.mpp * self.seg_downsample / 1000) ** 2
 
     def level_image(self, level: int) -> np.ndarray:
         """Whole pyramid level as (H, W, 3) uint8 RGB."""
@@ -360,49 +445,39 @@ class Slide:
         return self._tissue_mask
 
     def _segment_tissue(self) -> np.ndarray:
-        img = self._level_array(self._seg_level, *self._seg_shape)
+        """Otsu on darkness, closed, with sub-threshold components dropped.
 
-        # saturation separates stained tissue from the white/grey background far
-        # better than luminance; blur first so Otsu is not led by JPEG speckle
-        saturation = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)[:, :, 1]
-        saturation = cv2.medianBlur(saturation, MEDIAN_BLUR_PX)
-        _, binary = cv2.threshold(
-            saturation, 0, 255, cv2.THRESH_OTSU + cv2.THRESH_BINARY
-        )
+        **Darkness, not saturation.** Thresholding HSV saturation is the obvious
+        choice and it is wrong on faintly stained slides, which never separate
+        into two saturation modes. Otsu then has no valley to find and settles
+        around the 95th percentile, splitting *inside* the tissue and keeping
+        only its most saturated fragments -- on the worst corpus slide, 8.0 mm^2
+        of a specimen that covers 92.7. Darkness has a bimodal histogram on those
+        slides because glass is bright whatever the stain did, so Otsu's
+        assumption actually holds. Corpus-wide the two agree to within 3% of
+        tiles; the change is a tail fix, and the tail is 160 slides that gain
+        half again their tissue and 3 whose mask was empty.
+
+        The cleanup is two textbook operations. Closing bridges the gaps Otsu
+        leaves inside a section -- plain Otsu masks are perforated, and the
+        perforations are what make a centre-pixel tile rule so noisy. The area
+        floor then drops dust. Holes are deliberately *not* filled: a lumen is
+        not tissue and there is no reason to embed it.
+        """
+        img = self._level_array(self._seg_level, *self._seg_shape)
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        darkness = cv2.medianBlur(255 - gray, MEDIAN_BLUR_PX)
+        _, binary = cv2.threshold(darkness, 0, 255, cv2.THRESH_OTSU + cv2.THRESH_BINARY)
         kernel = np.ones((CLOSE_KERNEL_PX, CLOSE_KERNEL_PX), np.uint8)
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
-        contours, hierarchy = cv2.findContours(
-            binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE
-        )
-        mask = np.zeros(binary.shape, dtype=np.uint8)
-        if hierarchy is None:
-            return mask.astype(bool)
-
-        # thresholds are given in units of a 512 px reference patch at level 0
-        scale = self.seg_downsample
-        ref_area = REF_PATCH_PX**2 / (scale * scale)
-        min_tissue = MIN_TISSUE_AREA * ref_area
-        min_hole = MIN_HOLE_AREA * ref_area
-
-        hierarchy = hierarchy[0]  # (n, 4): next, prev, first_child, parent
-        for i, contour in enumerate(contours):
-            if hierarchy[i][3] != -1:  # not a top-level (foreground) contour
-                continue
-            holes = [j for j in range(len(contours)) if hierarchy[j][3] == i]
-            hole_areas = [cv2.contourArea(contours[j]) for j in holes]
-            # a ring of tissue is worth its ring, not its bounding blob
-            area = cv2.contourArea(contour) - sum(hole_areas)
-            if area <= min_tissue:
-                continue
-            cv2.drawContours(mask, [contour], -1, 255, cv2.FILLED)
-            # only the largest few holes are real lumen; the rest is speckle
-            biggest = sorted(zip(hole_areas, holes), reverse=True)
-            for hole_area, j in biggest[:MAX_HOLES_PER_CONTOUR]:
-                if hole_area > min_hole:
-                    cv2.drawContours(mask, [contours[j]], -1, 0, cv2.FILLED)
-
-        return mask.astype(bool)
+        # the floor is a physical area and a component is counted in pixels of
+        # the segmentation level, each `mpp * seg_downsample` microns across
+        min_px = MIN_TISSUE_AREA_MM2 / self.seg_px_mm2
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        keep = np.zeros(count, dtype=bool)
+        keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= min_px  # label 0 is background
+        return keep[labels]
 
     @property
     def grid_shape(self) -> tuple[int, int]:
@@ -424,20 +499,38 @@ class Slide:
         """(N, 2) int32 (col, row) index of each kept tile in the full grid."""
         return self.coords // self.extract_px
 
-    def _tissue_coords(self) -> np.ndarray:
-        """Row-major grid of tiles whose centre lands on tissue."""
+    def _tile_means(self, field: np.ndarray) -> np.ndarray:
+        """Mean of a segmentation-level field over each tile, as (n_rows, n_cols).
+
+        `INTER_AREA` computes an exact area-weighted mean, but only if the field
+        is first cropped to the region the tile grid actually covers. The grid
+        drops partial tiles at the right and bottom edge, so the tiled region is
+        smaller than the segmentation level -- resizing the whole thing instead
+        stretches the sampling grid and drifts it by whole tiles at the far edge
+        (0.68 max error against 0.03, and 1,099 tiles misclassified against 60).
+        The errors land on marginal tissue at mask boundaries, which is exactly
+        where a threshold decision is being made.
+        """
         n_cols, n_rows = self.grid_shape
+        tile_seg_px = self.extract_px / self.seg_downsample
+        height = min(field.shape[0], max(1, round(n_rows * tile_seg_px)))
+        width = min(field.shape[1], max(1, round(n_cols * tile_seg_px)))
+        return cv2.resize(
+            field[:height, :width], (n_cols, n_rows), interpolation=cv2.INTER_AREA
+        )
+
+    def _tissue_coords(self) -> np.ndarray:
+        """Row-major grid of tiles with enough tissue under them to be worth reading."""
+        n_cols, n_rows = self.grid_shape
+        if n_cols < 1 or n_rows < 1:  # slide narrower or shorter than one tile
+            return np.empty((0, 2), dtype=np.int32)
+
+        occupancy = self._tile_means(self.tissue_mask.astype(np.float32))
+        keep = occupancy >= self.min_occupancy
+
         # partial tiles at the right/bottom edge are dropped rather than padded
         xs = np.arange(n_cols, dtype=np.int32) * self.extract_px
         ys = np.arange(n_rows, dtype=np.int32) * self.extract_px
-
-        mask = self.tissue_mask
-        scale = self.seg_downsample
-        centre = self.extract_px / 2
-        mx = np.clip(((xs + centre) / scale).astype(int), 0, mask.shape[1] - 1)
-        my = np.clip(((ys + centre) / scale).astype(int), 0, mask.shape[0] - 1)
-
-        keep = mask[np.ix_(my, mx)]  # (n_rows, n_cols)
         rows, cols = np.nonzero(keep)  # nonzero is row-major, so coords are too
         return np.stack([xs[cols], ys[rows]], axis=1).astype(np.int32)
 
@@ -458,12 +551,33 @@ class Slide:
     def read_batch(self, indices: Sequence[int]) -> np.ndarray:
         """(B, tile_px, tile_px, 3) uint8. Ascending indices read fastest."""
         out = np.empty((len(indices), self.tile_px, self.tile_px, 3), dtype=np.uint8)
+        return self.read_batch_into(out, indices)
+
+    def read_batch_into(self, out: np.ndarray, indices: Sequence[int]) -> np.ndarray:
+        """Fill `out` -- (B, tile_px, tile_px, 3) uint8 -- with those tiles.
+
+        Taking the destination rather than returning one is what lets the caller
+        decide where a batch lives. `_dataset` hands in a view of a tensor whose
+        storage is already shared, so the tiles are decoded straight into the
+        buffer the parent process will read, with no intermediate allocation and
+        no copy on the way across.
+        """
+        if out.shape != (len(indices), self.tile_px, self.tile_px, 3):
+            raise ValueError(
+                f"destination is {out.shape}, expected "
+                f"{(len(indices), self.tile_px, self.tile_px, 3)}"
+            )
         for i, index in enumerate(indices):
-            out[i] = self[index]
+            x, y = (int(v) for v in self.coords[index])
+            self.read_region(x, y, out=out[i])
         return out
 
-    def read_region(self, x: int, y: int) -> np.ndarray:
-        """`extract_px` square at base-level (x, y), resized to `tile_px`."""
+    def read_region(self, x: int, y: int, out: np.ndarray | None = None) -> np.ndarray:
+        """`extract_px` square at base-level (x, y), resized to `tile_px`.
+
+        Writes into `out` when given -- a contiguous (tile_px, tile_px, 3) uint8
+        array -- rather than allocating a fresh tile.
+        """
         size = self.extract_px
         tw, th = self._tile_w, self._tile_h
 
@@ -484,12 +598,15 @@ class Slide:
         top, left = y - row0 * th, x - col0 * tw
         region = canvas[top : top + size, left : left + size]
         if size == self.tile_px:  # 20x scan at exactly the target MPP
-            return np.ascontiguousarray(region)
+            if out is None:
+                return np.ascontiguousarray(region)
+            np.copyto(out, region)
+            return out
         # INTER_AREA is the right filter for the ~2x downsample a 40x scan needs,
         # but degenerates to nearest when upsampling, which some 20x scans do
         interpolation = cv2.INTER_AREA if size > self.tile_px else cv2.INTER_LINEAR
         return cv2.resize(
-            region, (self.tile_px, self.tile_px), interpolation=interpolation
+            region, (self.tile_px, self.tile_px), dst=out, interpolation=interpolation
         )
 
     def _decode_segment(self, page, key: int, jpegtables) -> np.ndarray | None:
@@ -505,9 +622,7 @@ class Slide:
         decoded, _, _ = page.decode(data, key, jpegtables=jpegtables)
         # decode returns a leading sample axis; the shape is guaranteed by the
         # photometric/samplesperpixel checks in __init__, so reshape strictly
-        return np.asarray(decoded).reshape(
-            int(page.tilelength), int(page.tilewidth), 3
-        )
+        return np.asarray(decoded).reshape(int(page.tilelength), int(page.tilewidth), 3)
 
     def _segment(self, key: int) -> np.ndarray:
         """Decoded (tile_h, tile_w, 3) base segment `key`, from cache when possible."""
@@ -532,8 +647,31 @@ class Slide:
     def close(self):
         self._mosaic = (-1, None)
         self._cache.clear()
+        self._drop_page_cache()
         self._fh.close()
         self._tif.close()
+
+    def _drop_page_cache(self):
+        """Evict this slide's bytes from the OS page cache.
+
+        Every slide is read exactly once and never revisited, so the ~1-2 GB it
+        leaves in the page cache is dead weight that the kernel will hold onto
+        anyway. Over a corpus run that fills memory: on a 1.6 TB node the cache
+        reached 1.5 TB with 10 GB free, and once free memory is that tight the
+        readers' own batch allocations fall into *direct* reclaim -- synchronous,
+        charged to the reader as system time, and pathological under concurrency.
+        That, not decode and not I/O, is what made a minority of slides run at a
+        tenth of the GPU's rate while burning 30 cores.
+
+        Dropping a whole file can also discard readahead another worker on the
+        same slide was about to use, but workers take disjoint contiguous ranges
+        and the volume sustains an order of magnitude more read bandwidth than
+        this pipeline asks of it, so a re-read is much the cheaper mistake.
+        """
+        try:
+            os.posix_fadvise(self._fh.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        except (OSError, AttributeError):
+            pass  # not Linux, or the fd is already gone; advisory either way
 
     def __enter__(self) -> "Slide":
         return self
