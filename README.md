@@ -20,6 +20,7 @@ embeddings from pathology, transcriptomics and language foundation models. Three
 | [embed/gemma/](./embed/gemma) | pathology reports → Gemma 4 summaries → EmbeddingGemma 2 embeddings |
 | [embed/bulkformer/](./embed/bulkformer) | RNA-seq → Bulkformer embeddings — **placeholder, not yet written** |
 | [kserve-demo/](./kserve-demo) | a serving-shaped take on the same WSI job (uses slideflow): a local stand-in for a KServe `InferenceService` |
+| `compose.yaml` | builds all the `embed/` images (`docker compose build`) |
 | `env.yaml` / `requirements.txt` | the `emb-gdc` conda environment for the notebooks and local analysis |
 <!-- | `sample/` | two slides (one baseline JPEG, one JPEG 2000) used for smoke tests and benchmarks; gitignored | -->
 
@@ -52,6 +53,13 @@ API directly.
 3. **Extract and cleanup.** `gdc-client` writes one directory per file UUID. Embedding code should traverse the nested download structure.
 
 ## Embedding
+
+[compose.yaml](./compose.yaml) at the repo root builds every embedding image under the tag its
+sbatch launcher expects. `HF_TOKEN` is needed for the gated Virchow weights:
+
+```bash
+HF_TOKEN=hf_xxx docker compose build   # or append a service: virchow, gemma
+```
 
 ### `embed/virchow` — whole-slide images
 

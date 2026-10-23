@@ -1,0 +1,25 @@
+# Builds every embedding image under the tags the sbatch launchers run by default.
+# Build-only: jobs are run with `docker run` from the sbatch scripts, not `compose up`.
+#
+#   HF_TOKEN=hf_xxx docker compose build   # all images
+#   docker compose build gemma             # just one
+#
+# HF_TOKEN is only needed for virchow (paige-ai/Virchow is gated); it is passed as
+# a BuildKit secret, never a build arg, so it stays out of the image history.
+
+services:
+  virchow:
+    image: virchow-embedder:latest
+    build:
+      context: embed/virchow
+      secrets:
+        - hf_token
+
+  gemma:
+    image: gemma-embedder:latest
+    build:
+      context: embed/gemma
+
+secrets:
+  hf_token:
+    environment: HF_TOKEN
