@@ -1,11 +1,14 @@
 # Download and Embed GDC Tumor Data
 
 Pull TCGA primary-tumor data from the [GDC](https://portal.gdc.cancer.gov/) and turn it into
-embeddings from pathology and transcriptomics foundation models. Two modalities are in scope:
+embeddings from pathology, transcriptomics and language foundation models. Three modalities are in scope:
 
 * **Whole-slide images** — 11,684 diagnostic `.svs` slides (~12.9 TB), embedded per-tile with
   [Virchow](https://huggingface.co/paige-ai/Virchow).
 * **Bulk RNA-seq** — 10,157 STAR gene-count tables, embedded with [Bulkformer](https://github.com/KangBoming/BulkFormer).
+* **Pathology reports** — 9,523 OCR'd reports from [TCGA-Reports](https://data.mendeley.com/datasets/hyg5xkznpx/1),
+  summarized with [Gemma 4 31B](https://huggingface.co/google/gemma-4-31B-it) and embedded with
+  [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2).
 
 ## Repo Layout
 
@@ -14,6 +17,7 @@ embeddings from pathology and transcriptomics foundation models. Two modalities 
 | [notebooks/](./notebooks) | GDC API queries that build the download manifests |
 | [manifests/](./manifests) | the manifests those notebooks emit, fed to `gdc-client` |
 | [embed/virchow/](./embed/virchow) | WSI → per-tile Virchow embeddings; our own, very fast WSI tiling for TCGA slides; the production embedding pipeline |
+| [embed/gemma/](./embed/gemma) | pathology reports → Gemma 4 summaries → EmbeddingGemma 2 embeddings |
 | [embed/bulkformer/](./embed/bulkformer) | RNA-seq → Bulkformer embeddings — **placeholder, not yet written** |
 | [kserve-demo/](./kserve-demo) | a serving-shaped take on the same WSI job (uses slideflow): a local stand-in for a KServe `InferenceService` |
 | `env.yaml` / `requirements.txt` | the `emb-gdc` conda environment for the notebooks and local analysis |
@@ -63,6 +67,15 @@ build, run, tuning and output format.
 **Not written yet.** Intended as a sibling of `embed/virchow`: same shape — a container pointed at a
 directory of GDC RNA-seq gene-count `.tsv` files, writing one embedding per sample to HDF5 — using
 Bulkformer as the encoder instead of Virchow. Nothing about the interface is settled beyond that.
+
+### `embed/gemma` — pathology reports
+
+A container that runs vLLM in-process for both steps of the report pipeline from
+[multimodal-cancer-modeling](https://github.com/StevenSong/multimodal-cancer-modeling). Gemma 4 31B
+writes a one-paragraph summary of each report. EmbeddingGemma 2 then embeds the raw reports and the
+summaries, 768-d per report. The prompt and decoding match the original; the models replace its
+Llama-3.1-8B and BioMistral. The `.h5` layout also matches, so that repo's survival notebooks read
+the output unchanged. See [embed/gemma/README.md](./embed/gemma/README.md).
 
 ## `kserve-demo`
 

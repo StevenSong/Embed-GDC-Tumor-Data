@@ -1,0 +1,15 @@
+# Direct dependencies of the embedder package.
+#
+# vllm pins torch (2.13.0, the same pin as embed/virchow) and its CUDA build, so
+# torch is deliberately not listed here.
+#
+# transformers is pinned separately because vllm's own floor is too low: vllm
+# 0.32.0 accepts >=5.16.1, but EmbeddingGemma 2 (`embedding_gemma2`) first
+# ships in transformers 5.19.0, and vllm imports its config and processor from
+# there. Anything in [5.16.1, 5.19) installs cleanly and then fails to load
+# the embedding model.
+
+h5py                    # embedding output, one dataset per report
+pandas                  # report CSVs in and out
+transformers>=5.19,<5.20
+vllm==0.32.0
