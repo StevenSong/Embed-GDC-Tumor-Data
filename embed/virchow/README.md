@@ -7,6 +7,9 @@ container at a directory of WSIs and it writes, per slide:
 * `<out-dir>/thumbnails/<slide>.png` — the slide thumbnail with everything that was not
   embedded dimmed out
 
+A second step, `python -m embedder.aggregate`, then collects every slide's mean embedding into one
+`<out-dir>/hist.h5` — see [Slide-level `hist.h5`](#slide-level-histh5).
+
 Slides are read directly off the Aperio pyramid with [tifffile](https://github.com/cgohlke/tifffile)
 (see `src/embedder/_reader.py`) and cut into 224 px tiles at 20x (0.5 MPP). Tissue detection
 thresholds **darkness** — inverted grayscale — with Otsu, closes the result, and drops connected
@@ -145,6 +148,21 @@ container skips any slide that already has an `.h5`, so a shard that dies can be
 whole run re-submitted with a different `--shards`, without reshuffling files on disk. A plain stride
 balances to within 1% over a corpus this size, so there is nothing to tune.
 
+### On Slurm
+
+`run-corpus.sh` submits a whole run: `SHARDS` jobs of `embed-corpus.sbatch`, one GPU each, then one
+`aggregate.sbatch` that depends on all of them (`afterok`) and writes `hist.h5`:
+
+```bash
+SLIDE_DIR=/path/to/slides OUT_DIR=/path/to/out SHARDS=4 embed/virchow/run-corpus.sh
+```
+
+The aggregate job only runs if every shard exits 0. A shard that fails a slide or hits the time
+limit cancels it (`--kill-on-invalid-dep=yes`) rather than leaving it pending; fix the cause and run
+the script again. The embed jobs skip slides already embedded, so a rerun only redoes what is
+missing, and the aggregate job always rebuilds `hist.h5` from scratch. `IMAGE` and `SHM_SIZE` in
+the environment pass through to the jobs.
+
 `TORCHINDUCTOR_CACHE_DIR` on a persistent volume is worth setting: it amortises the ~60 s
 compilation across runs. Without it, every run pays it again.
 
@@ -210,3 +228,31 @@ and `qc_min_occupancy`. A tile's *embedding* never depends on QC, only which til
 
 `mpp_source` is `header` when the Aperio header carried an `MPP` field, and otherwise names the
 `AppMag` it was derived from — the slides worth knowing about when reviewing a finished run.
+
+## Slide-level `hist.h5`
+
+`python -m embedder.aggregate --emb-dir <out-dir>/embeddings --output-h5 <out-dir>/hist.h5` (run
+by `aggregate.sbatch`, no GPU, a few minutes) collects every slide's `mean` into one file in the
+layout of `embed/embed_hist_uni2.py` from
+[multimodal-cancer-modeling](https://github.com/StevenSong/multimodal-cancer-modeling), so its
+survival notebooks read it unchanged:
+
+```
+hist.h5
+  /<case>/          one group per case, by TCGA barcode, e.g. TCGA-OR-A5J1
+     <slide>        float32 (2560,), the slide's `mean`; named by file stem
+```
+
+A case with several slides keeps them all, and averaging across a case is left to the reader (the
+notebooks take an unweighted mean). The vector is copied from `mean` rather than recomputed from
+`features`, which is both ~10 KB a slide instead of the whole corpus and more exact, since `mean`
+was accumulated before the fp16 cast. Each slide dataset carries `n_tiles`, `mpp` and
+`mpp_source`. The root carries the corpus-wide config — `encoder`, `encoder_source`, `embed_dim`,
+`precision`, `tile_px`, `tile_um`, `qc`, `qc_min_tissue_mm2`, `qc_min_occupancy` — plus
+`aggregation`, `emb_dir`, `n_slides`, `n_cases` and `created_utc`.
+
+Every `.h5` in `--emb-dir` goes in; there is no cohort filtering. The input is checked as a whole
+first, and any bad file fails the run without writing anything: no `mean`, a non-finite `mean`, a
+name that is not a TCGA barcode, or a corpus-wide attribute that differs from the other files (a
+stale `qc` from an older run, say). The file is written to `.hist.h5.tmp` and renamed into place,
+and an existing `hist.h5` is kept unless `--overwrite` is passed.

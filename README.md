@@ -59,8 +59,10 @@ A self-contained container that walks a directory of `.svs` slides and writes, p
 of per-tile Virchow embeddings plus a masked thumbnail. Slides are read straight off the Aperio
 pyramid with `tifffile`, tissue is detected CLAM-style, and 224 px tiles at 20x are streamed to a
 `torch.compile`d Virchow. It sustains ~1200 tiles/s on one H200 — roughly 35 h for the whole TCGA
-diagnostic corpus on a single GPU. See [embed/virchow/README.md](./embed/virchow/README.md) for
-build, run, tuning and output format.
+diagnostic corpus on a single GPU. A second, GPU-free step collects each slide's mean embedding
+into one `hist.h5` in [multimodal-cancer-modeling](https://github.com/StevenSong/multimodal-cancer-modeling)'s
+layout, so its survival notebooks read it unchanged; `run-corpus.sh` submits both to Slurm. See
+[embed/virchow/README.md](./embed/virchow/README.md) for build, run, tuning and output format.
 
 ### `embed/bulkformer` — bulk RNA-seq
 

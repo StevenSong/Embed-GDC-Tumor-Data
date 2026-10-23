@@ -8,18 +8,17 @@
 # an .h5 are skipped, so a job that hits the time limit can simply be resubmitted.
 #
 #   SLIDE_DIR=/path/to/input/wsis \
-#   OUT_DIR=/path/to/output/embeddings \
+#   OUT_DIR=/path/to/output \
 #     sbatch embed/virchow/embed-corpus.sbatch
 #
 # To spread the corpus over several GPUs, submit one job per shard against the
-# same SLIDE_DIR and OUT_DIR. Each job takes every Nth slide and skips anything
-# already embedded, so the shards never collide and any one of them can be
-# resubmitted on its own:
+# same SLIDE_DIR and OUT_DIR, varying SHARD=i with SHARDS=n. Each job takes every
+# Nth slide and skips anything already embedded, so the shards never collide and
+# any one of them can be resubmitted on its own.
 #
-#   for i in 0 1 2 3; do
-#     SLIDE_DIR=... OUT_DIR=... SHARD=$i SHARDS=4 \
-#       sbatch embed/virchow/embed-corpus.sbatch
-#   done
+# This is one step of two. run-corpus.sh submits the shards and then
+# aggregate.sbatch, which waits on all of them to write $OUT_DIR/hist.h5; use it
+# rather than submitting this by hand.
 #
 set -euo pipefail
 
