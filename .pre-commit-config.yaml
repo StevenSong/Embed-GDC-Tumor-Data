@@ -1,0 +1,15 @@
+repos:
+  - repo: https://github.com/kynan/nbstripout
+    rev: 0.8.1
+    hooks:
+      - id: nbstripout
+        exclude: user-study/.*\.ipynb
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.2
+    hooks:
+      # import sorting only (isort replacement); format must run after
+      - id: ruff-check
+        args: ["--select", "I", "--fix"]
+        types_or: [python, pyi]
+      - id: ruff-format
+        types_or: [python, pyi]
