@@ -229,4 +229,5 @@ temp-*
 temp.*
 temp/
 .devcontainer/
+m3ai-demos/
 multimodal-cancer-modeling/
