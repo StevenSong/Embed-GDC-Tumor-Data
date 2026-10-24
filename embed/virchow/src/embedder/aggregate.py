@@ -6,6 +6,11 @@ named by TCGA submitter barcode (`TCGA-OR-A5J1`), and one float32 `(2560,)`
 dataset per slide under it, named by the slide's file stem. A case with several
 slides keeps them all; averaging across a case is the reader's call.
 
+A DICOM slide (CPTAC) is grouped by the `case_id` its file carries -- the
+header's PatientID, `C3L-04408` -- rather than by parsing its name, since a
+CPTAC slide barcode does not encode which part is the case. A file without
+`case_id` is a TCGA .svs and must be named by a TCGA barcode.
+
     python -m embedder.aggregate --emb-dir /out/embeddings --output-h5 /out/hist.h5
 
 The slide vector is the per-slide file's own `mean`, copied rather than
@@ -16,7 +21,7 @@ averaging the stored fp16 `features` would be the lossier of the two.
 
 Every `.h5` in --emb-dir goes in; there is no cohort filtering here. The input
 is checked as a whole before anything is written, and one bad file -- no
-`mean`, a non-finite one, a name that is not a TCGA barcode, or a tiling or
+`mean`, a non-finite one, no case to file it under, or a tiling or
 encoder config that differs from the rest -- fails the run. A slide-level file
 quietly missing slides, or mixing two QC configs, is the outcome worth ruling
 out.
@@ -105,8 +110,10 @@ def aggregate(
     config = None
     for path in tqdm(paths, desc="slides", disable=progress_disabled()):
         try:
-            case = case_id(path.stem)
             mean, attrs = read_slide(path)
+            case = str(attrs["case_id"]) if "case_id" in attrs else case_id(path.stem)
+            if not case:
+                raise ValueError("empty `case_id`")
         except (OSError, ValueError) as exc:
             logger.error("%s: %s", path.name, exc)
             bad += 1

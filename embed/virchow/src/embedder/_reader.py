@@ -1,10 +1,18 @@
-"""Tile reader for Aperio SVS slides, built directly on tifffile.
+"""Tile reader for Aperio SVS slides and DICOM-TIFF series, built directly on tifffile.
 
 Scope is deliberately narrow: GDC/TCGA diagnostic slides, which are pyramidal
 tiled TIFFs whose base level is either baseline JPEG (compression 7, abbreviated
 streams that need the page's shared `jpegtables`) or Aperio JPEG 2000
 (compression 33003/33005, self-contained codestreams). Anything else -- striped
 TIFFs, .mrxs, .ndpi, .bif -- is rejected rather than half-supported.
+
+The one other format is the DICOM whole-slide series IDC serves the CPTAC
+collections as, and it is in scope only because it is the same thing underneath:
+PixelMed converted those .svs files into dual-personality DICOM-TIFF, one file
+per pyramid level, each a tiled TIFF whose tiles are the DICOM frames. The
+pixels go through exactly the SVS decode path; only the metadata -- which file
+is which level, the pixel spacing, the slide's name -- comes from the DICOM
+header. See `_read_dicom_series`.
 
 Tissue detection thresholds *darkness* -- inverted grayscale -- with Otsu, closes
 the result, and drops connected components below a physical area floor. A tile is
@@ -14,7 +22,7 @@ and not the centre pixel.
 
 `Slide` is a sequence of tiles::
 
-    slide = Slide("TCGA-A2-A25A-01Z-00-DX1.svs")
+    slide = Slide("TCGA-A2-A25A-01Z-00-DX1.svs")  # or a DICOM series directory
     len(slide)          # tiles surviving tissue detection
     slide[0]            # (224, 224, 3) uint8 RGB
     slide.coords[0]     # base-level (x, y) of that tile's top-left corner
@@ -29,11 +37,13 @@ from __future__ import annotations
 import os
 import re
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Iterator, NamedTuple, Sequence
 
 import cv2
 import numpy as np
+import pydicom
 import tifffile
 
 # every Slide lives in its own worker process so prevent OpenCV from doing it's own parallelism
@@ -44,6 +54,14 @@ JPEG = 7
 APERIO_JP2000_YCBC = 33003
 APERIO_JP2000_RGB = 33005
 SUPPORTED_COMPRESSION = (JPEG, APERIO_JP2000_YCBC, APERIO_JP2000_RGB)
+
+# VL Whole Slide Microscopy Image Storage: one instance per pyramid level, plus
+# the slide's label, overview and thumbnail images
+WSI_SOP_CLASS = "1.2.840.10008.5.1.4.1.1.77.1.6"
+DICOM_EXT = ".dcm"
+# Tiles are square in base pixels, so pixels have to be close to square too. The
+# worst in CPTAC are the 12 non-Aperio scans, at 0.3%
+MAX_PIXEL_ANISOTROPY = 0.01
 
 # Tissue detection here is an original implementation, and it has to stay one.
 # The obvious references are all copyleft or non-commercial and cannot be
@@ -185,6 +203,135 @@ def _resolve_mpp(description: str, dimensions: tuple[int, int]) -> tuple[float, 
     return mpp, f"AppMag={match.group(1)}"
 
 
+@dataclass(frozen=True)
+class _DicomSeries:
+    levels: list[Path]  # the VOLUME instances, base level first
+    shapes: list[tuple[int, int]]  # (height, width) of each, from the header
+    mpp: float
+    name: str
+    case_id: str  # PatientID, which aggregate groups by
+
+
+def _dicom_name(ds) -> str:
+    """What a DICOM slide's outputs are named after.
+
+    ContainerIdentifier is the slide's barcode -- `C3L-04408-26` -- and in CPTAC
+    it is exactly the stem of the .svs the series was converted from. It is a
+    mandatory attribute of the IOD, so the fallback is for malformed files only.
+    """
+    return str(ds.get("ContainerIdentifier", "")).strip() or str(ds.SeriesInstanceUID)
+
+
+def _read_dicom_series(directory: Path) -> _DicomSeries:
+    """The pyramid of one DICOM WSI series, from its headers alone.
+
+    The pixels are read through tifffile, which is only possible because every
+    CPTAC file in IDC is a dual-personality DICOM-TIFF -- `Slide` rejects any
+    level that is not. Everything else a level needs is checked here, so that a
+    series which is not one plain brightfield pyramid -- several focal planes,
+    several optical paths, a sparse tiling -- is refused up front rather than
+    read as if it were.
+    """
+    volumes = []
+    series_uids = set()
+    for path in sorted(directory.glob(f"*{DICOM_EXT}")):
+        # the ICC profile alone is 1.7 MB a file; defer anything that size
+        ds = pydicom.dcmread(path, stop_before_pixels=True, defer_size="1 KB")
+        if ds.get("SOPClassUID") != WSI_SOP_CLASS:
+            raise UnsupportedSlideError(f"{path}: not a whole-slide microscopy image")
+        series_uids.add(str(ds.SeriesInstanceUID))
+        image_type = list(ds.get("ImageType", []))
+        # label, overview and thumbnail instances are not pyramid levels
+        if len(image_type) >= 3 and image_type[2] == "VOLUME":
+            volumes.append((path, ds))
+    if len(series_uids) > 1:
+        raise UnsupportedSlideError(
+            f"{directory}: {len(series_uids)} series in one directory"
+        )
+    if not volumes:
+        raise UnsupportedSlideError(f"{directory}: no VOLUME instances")
+
+    for path, ds in volumes:
+        if ds.get("DimensionOrganizationType") != "TILED_FULL":
+            raise UnsupportedSlideError(
+                f"{path}: tiling {ds.get('DimensionOrganizationType')!r}, expected"
+                " TILED_FULL"
+            )
+        planes = int(ds.get("TotalPixelMatrixFocalPlanes", 1) or 1)
+        paths = int(ds.get("NumberOfOpticalPaths", 1) or 1)
+        if planes != 1 or paths != 1:
+            raise UnsupportedSlideError(
+                f"{path}: {planes} focal planes and {paths} optical paths, expected 1"
+            )
+
+    volumes.sort(key=lambda v: -int(v[1].TotalPixelMatrixColumns))
+    shapes = [
+        (int(ds.TotalPixelMatrixRows), int(ds.TotalPixelMatrixColumns))
+        for _, ds in volumes
+    ]
+    widths = [w for _, w in shapes]
+    if any(a <= b for a, b in zip(widths, widths[1:])):
+        raise UnsupportedSlideError(
+            f"{directory}: VOLUME widths {widths} are not a pyramid"
+        )
+
+    base = volumes[0][1]
+    try:
+        measures = base.SharedFunctionalGroupsSequence[0].PixelMeasuresSequence[0]
+        row_mm, col_mm = (float(v) for v in measures.PixelSpacing)
+    except (AttributeError, IndexError, ValueError) as exc:
+        raise UnsupportedSlideError(f"{volumes[0][0]}: no PixelSpacing") from exc
+    if not row_mm > 0 or not col_mm > 0:
+        raise UnsupportedSlideError(
+            f"{volumes[0][0]}: PixelSpacing {row_mm}, {col_mm} mm"
+        )
+    if abs(row_mm / col_mm - 1) > MAX_PIXEL_ANISOTROPY:
+        raise UnsupportedSlideError(
+            f"{volumes[0][0]}: pixels are {row_mm} x {col_mm} mm, not square"
+        )
+
+    return _DicomSeries(
+        levels=[path for path, _ in volumes],
+        shapes=shapes,
+        # PixelSpacing is in mm, as (row, column) spacing
+        mpp=1000 * (row_mm + col_mm) / 2,
+        name=_dicom_name(base),
+        case_id=str(base.get("PatientID", "")).strip(),
+    )
+
+
+class SlideRef(NamedTuple):
+    path: Path  # an .svs (or other TIFF) file, or a DICOM series directory
+    name: str  # outputs are written as <name>.h5 and <name>.png
+
+
+def find_slides(slide_dir: Path, exts: set[str]) -> list[SlideRef]:
+    """Every slide under `slide_dir`.
+
+    A TIFF slide is a file and is named by its stem. A DICOM slide is a whole
+    series directory, which `.dcm` in `exts` turns on, and is named by its
+    ContainerIdentifier -- the series directory's own name is a UID. Only one
+    header per directory is read here, for the name; `Slide` validates the
+    series when it opens it, and rejects one that is not a whole-slide image.
+    """
+    refs = []
+    for dirpath, _, filenames in os.walk(slide_dir):
+        directory = Path(dirpath)
+        dicoms = sorted(f for f in filenames if f.lower().endswith(DICOM_EXT))
+        for f in filenames:
+            p = directory / f
+            if p.suffix.lower() in exts and p.suffix.lower() != DICOM_EXT:
+                refs.append(SlideRef(p, p.stem))
+        if DICOM_EXT in exts and dicoms:
+            ds = pydicom.dcmread(
+                directory / dicoms[0],
+                stop_before_pixels=True,
+                specific_tags=["ContainerIdentifier", "SeriesInstanceUID"],
+            )
+            refs.append(SlideRef(directory, _dicom_name(ds)))
+    return sorted(refs)
+
+
 class _SegmentCache:
     """Byte-budgeted LRU over decoded TIFF segments."""
 
@@ -248,9 +395,31 @@ class Slide:
         self.target_mpp = target_mpp
         self.min_occupancy = min_occupancy
 
-        self._tif = tifffile.TiffFile(self.path)
-        series = self._tif.series[0]  # "Baseline"; series[1] is Aperio's thumbnail
-        self._levels = series.levels
+        dicom = None
+        if Path(self.path).is_dir():
+            dicom = _read_dicom_series(Path(self.path))
+            self._tifs = []
+            for level, shape in zip(dicom.levels, dicom.shapes):
+                try:
+                    tif = tifffile.TiffFile(level)
+                except tifffile.TiffFileError as exc:
+                    self.close()
+                    raise UnsupportedSlideError(
+                        f"{level}: not a dual-personality DICOM-TIFF"
+                    ) from exc
+                self._tifs.append(tif)
+                if tif.series[0].shape[:2] != shape:
+                    self.close()
+                    raise UnsupportedSlideError(
+                        f"{level}: TIFF is {tif.series[0].shape[:2]} but DICOM"
+                        f" says {shape}"
+                    )
+            # one file per level, each a single-page series
+            self._levels = [tif.series[0] for tif in self._tifs]
+        else:
+            self._tifs = [tifffile.TiffFile(self.path)]
+            # "Baseline"; series[1] is Aperio's thumbnail
+            self._levels = self._tifs[0].series[0].levels
         self._page = self._levels[0].keyframe
 
         page = self._page
@@ -289,7 +458,16 @@ class Slide:
             )
 
         self.dimensions = (int(page.imagewidth), int(page.imagelength))  # (x, y)
-        self.mpp, self.mpp_source = _resolve_mpp(page.description, self.dimensions)
+        if dicom is None:
+            self.name = Path(self.path).name
+            self.mpp, self.mpp_source = _resolve_mpp(page.description, self.dimensions)
+            self.case_id: str | None = None  # aggregate parses it from the barcode
+        else:
+            # the DICOM header's PixelSpacing, which on every CPTAC slide that
+            # still carries its Aperio description agrees with its MPP exactly
+            self.name = dicom.name
+            self.mpp, self.mpp_source = dicom.mpp, "PixelSpacing"
+            self.case_id = dicom.case_id or None
 
         # base-level pixels per tile: ~440-490 on the 40x majority, but down to
         # tile_px itself on the 20x tail, so read_region resizes in either
@@ -302,7 +480,7 @@ class Slide:
         self._jpegtables = page.jpegtables  # None for JPEG 2000
 
         # own handle: tifffile's is guarded by a lock we would only contend on
-        self._fh = open(self.path, "rb")
+        self._fh = open(self._page.parent.filehandle.path, "rb")
         self._cache = _SegmentCache(segment_cache_mb * 1024 * 1024)
 
         self._mosaic: tuple[int, np.ndarray | None] = (-1, None)
@@ -404,7 +582,11 @@ class Slide:
                 dx0, dx1 = round(x0 * out_w / width), round(x1 * out_w / width)
                 if dx1 <= dx0:
                     continue
-                segment = self._decode_segment(page, row * cols + col, jpegtables)
+                # tifffile's own handle, since a DICOM level is its own file;
+                # this runs once, in the parent, so there is no lock to contend
+                segment = self._decode_segment(
+                    page, row * cols + col, jpegtables, page.parent.filehandle
+                )
                 if segment is None:
                     continue
                 segment = segment[: y1 - y0, : x1 - x0]
@@ -474,7 +656,9 @@ class Slide:
         # the floor is a physical area and a component is counted in pixels of
         # the segmentation level, each `mpp * seg_downsample` microns across
         min_px = MIN_TISSUE_AREA_MM2 / self.seg_px_mm2
-        count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            binary, connectivity=8
+        )
         keep = np.zeros(count, dtype=bool)
         keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= min_px  # label 0 is background
         return keep[labels]
@@ -609,13 +793,16 @@ class Slide:
             region, (self.tile_px, self.tile_px), dst=out, interpolation=interpolation
         )
 
-    def _decode_segment(self, page, key: int, jpegtables) -> np.ndarray | None:
-        """Segment `key` of `page` as (tile_h, tile_w, 3) uint8, None if sparse."""
+    def _decode_segment(self, page, key: int, jpegtables, fh) -> np.ndarray | None:
+        """Segment `key` of `page`, read from `fh`, as (tile_h, tile_w, 3) uint8.
+
+        None if the segment is sparse.
+        """
         count = page.databytecounts[key]
         if count == 0:  # sparse segment: Aperio writes nothing for blank tiles
             return None
-        self._fh.seek(page.dataoffsets[key])
-        data = self._fh.read(count)
+        fh.seek(page.dataoffsets[key])
+        data = fh.read(count)
         # tifffile owns the Aperio quirks: abbreviated JPEG streams need the
         # page's shared tables, and 33003 carries an undeclared YCbCr transform
         # that a raw jpeg2k decode gets wrong
@@ -630,7 +817,7 @@ class Slide:
         if segment is not None:
             return segment
 
-        segment = self._decode_segment(self._page, key, self._jpegtables)
+        segment = self._decode_segment(self._page, key, self._jpegtables, self._fh)
         if segment is None:
             segment = np.zeros((self._tile_h, self._tile_w, 3), dtype=np.uint8)
 
@@ -645,11 +832,15 @@ class Slide:
     # ----------------------------------------------------------------- cleanup
 
     def close(self):
-        self._mosaic = (-1, None)
-        self._cache.clear()
-        self._drop_page_cache()
-        self._fh.close()
-        self._tif.close()
+        # also the cleanup for a DICOM series refused halfway through __init__,
+        # which has opened some of its levels and nothing else yet
+        if hasattr(self, "_fh"):
+            self._mosaic = (-1, None)
+            self._cache.clear()
+            self._drop_page_cache()
+            self._fh.close()
+        for tif in self._tifs:
+            tif.close()
 
     def _drop_page_cache(self):
         """Evict this slide's bytes from the OS page cache.
@@ -668,10 +859,13 @@ class Slide:
         and the volume sustains an order of magnitude more read bandwidth than
         this pipeline asks of it, so a re-read is much the cheaper mistake.
         """
-        try:
-            os.posix_fadvise(self._fh.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
-        except (OSError, AttributeError):
-            pass  # not Linux, or the fd is already gone; advisory either way
+        # a DICOM series' other levels are separate files, and tissue detection
+        # and the thumbnail read them through tifffile's handles
+        for fh in [self._fh, *(tif.filehandle for tif in self._tifs)]:
+            try:
+                os.posix_fadvise(fh.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+            except (OSError, AttributeError):
+                pass  # not Linux, or the fd is already gone; advisory either way
 
     def __enter__(self) -> "Slide":
         return self

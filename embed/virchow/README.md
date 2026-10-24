@@ -1,7 +1,8 @@
 # Virchow Tile Embeddings
 
 Embeds whole-slide images with [Virchow](https://huggingface.co/paige-ai/Virchow). Point the
-container at a directory of WSIs and it writes, per slide:
+container at a directory of WSIs — Aperio `.svs` (TCGA) or DICOM whole-slide series (CPTAC) — and
+it writes, per slide:
 
 * `<out-dir>/embeddings/<slide>.h5` — one embedding per tile, with tile coordinates
 * `<out-dir>/thumbnails/<slide>.png` — the slide thumbnail with everything that was not
@@ -24,9 +25,26 @@ splits inside the tissue instead (8.0 mm² kept of a 92.7 mm² specimen on the w
 and **occupancy rather than the centre pixel**, because a tile is only ~15 mask pixels across at
 the segmentation level, so a centre test point-samples 1 pixel in ~236.
 
-**Only Aperio-style tiled SVS pyramids are supported.** Striped TIFFs and other vendor formats
-(`.mrxs`, `.ndpi`, `.bif`) are rejected with `UnsupportedSlideError` rather than half-supported.
-**A CUDA device is required**; there is no CPU path.
+**Only Aperio-style tiled SVS pyramids, and the DICOM-TIFF series converted from them, are
+supported.** Striped TIFFs and other vendor formats (`.mrxs`, `.ndpi`, `.bif`) are rejected with
+`UnsupportedSlideError` rather than half-supported. **A CUDA device is required**; there is no CPU
+path.
+
+### DICOM slides (CPTAC)
+
+[IDC](https://portal.imaging.datacommons.cancer.gov/) distributes the CPTAC pathology as DICOM, one series directory per slide holding one `.dcm`
+per pyramid level plus a label, overview and thumbnail. Every one of those files is a
+*dual-personality* DICOM-TIFF — PixelMed converted them from the original `.svs`, so each is also
+a valid tiled TIFF whose tiles are the DICOM frames, still in the Aperio codecs. The reader
+therefore decodes them on exactly the SVS path; only the metadata comes from the DICOM header
+(via pydicom): which files are pyramid levels (`ImageType` `VOLUME`), the pixel size
+(`PixelSpacing`, which agrees with the Aperio `MPP` the header still carries), and the slide's name.
+
+A DICOM slide is named by its `ContainerIdentifier` — `C3L-04408-26`, exactly the stem of the
+`.svs` it was converted from — since the series directory's own name is a UID. Discovery reads one
+header per directory, for that name. A series that is not a whole-slide image is rejected when it is
+opened, so the slide directory should hold slides only — the download this repo builds is tumor
+H&E slides and nothing else, see [Download data](../../README.md#cptac-slides).
 
 ### Throughput
 
@@ -172,7 +190,7 @@ compilation across runs. Without it, every run pays it again.
 | -------------------- | ---------------------- | ---------------------------------------- |
 | `--slide-dir`        | `/slides`              | directory of WSIs, searched recursively  |
 | `--out-dir`          | `/out`                 | parent of `embeddings/` and `thumbnails/` |
-| `--exts`             | `.svs`                 | slide extensions to look for             |
+| `--exts`             | `.svs .dcm`            | slide extensions to look for; `.dcm` means DICOM series directories |
 | `--batch-size`       | 512                    | tiles per forward pass                   |
 | `--num-tile-readers` | 32                     | worker processes reading tiles, **per pool**; there are two |
 | `--prefetch-factor`  | 2                      | tile batches each reader buffers ahead of the GPU |
@@ -220,14 +238,17 @@ than assume row-major.
 Root attributes record how the file was produced: `slide`, `slide_path`, `encoder`,
 `encoder_source`, `embed_dim`, `n_tiles`, `tile_px`, `tile_um`, `qc`, `qc_min_tissue_mm2`,
 `qc_min_occupancy`, `precision`, `feature_dtype`, `mpp`, `mpp_source`, `slide_dimensions`,
-`grid_shape`, `thumbnail`, `created_utc`, `torch_version`.
+`grid_shape`, `thumbnail`, `created_utc`, `torch_version`. DICOM slides add `case_id` (the
+header's `PatientID`); `slide` is the `ContainerIdentifier` and `slide_path` the series directory.
+Everything else about a CPTAC slide is in the metadata table the download manifest was built with.
 
 `qc` names the tissue-detection config the tile set came from — `gray-otsu-occupancy` is the
 current one, `otsu` the older saturation-and-centre-pixel scheme — alongside `qc_min_tissue_mm2`
 and `qc_min_occupancy`. A tile's *embedding* never depends on QC, only which tiles exist.
 
-`mpp_source` is `header` when the Aperio header carried an `MPP` field, and otherwise names the
-`AppMag` it was derived from — the slides worth knowing about when reviewing a finished run.
+`mpp_source` is `header` when the Aperio header carried an `MPP` field, `PixelSpacing` for a DICOM
+slide, and otherwise names the `AppMag` it was derived from — the slides worth knowing about when
+reviewing a finished run.
 
 ## Slide-level `hist.h5`
 
@@ -243,6 +264,9 @@ hist.h5
      <slide>        float32 (2560,), the slide's `mean`; named by file stem
 ```
 
+A DICOM slide is filed under its `case_id` attribute instead (`C3L-04408`), since a CPTAC slide
+barcode does not say which part of it is the case.
+
 A case with several slides keeps them all, and averaging across a case is left to the reader (the
 notebooks take an unweighted mean). The vector is copied from `mean` rather than recomputed from
 `features`, which is both ~10 KB a slide instead of the whole corpus and more exact, since `mean`
@@ -252,7 +276,7 @@ was accumulated before the fp16 cast. Each slide dataset carries `n_tiles`, `mpp
 `aggregation`, `emb_dir`, `n_slides`, `n_cases` and `created_utc`.
 
 Every `.h5` in `--emb-dir` goes in; there is no cohort filtering. The input is checked as a whole
-first, and any bad file fails the run without writing anything: no `mean`, a non-finite `mean`, a
-name that is not a TCGA barcode, or a corpus-wide attribute that differs from the other files (a
-stale `qc` from an older run, say). The file is written to `.hist.h5.tmp` and renamed into place,
+first, and any bad file fails the run without writing anything: no `mean`, a non-finite `mean`, no
+case to file it under (no `case_id`, and a name that is not a TCGA barcode), or a corpus-wide
+attribute that differs from the other files (a stale `qc` from an older run, say). The file is written to `.hist.h5.tmp` and renamed into place,
 and an existing `hist.h5` is kept unless `--overwrite` is passed.

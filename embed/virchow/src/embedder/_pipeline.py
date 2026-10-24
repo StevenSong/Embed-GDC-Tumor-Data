@@ -34,7 +34,8 @@ COMPILE_MODE = "max-autotune"
 
 def slide_metadata(prep: "PreparedSlide") -> dict[str, str | int | float | np.ndarray]:
     return {
-        "slide": prep.slide_path.name,
+        # the .svs file name, or a DICOM slide's ContainerIdentifier
+        "slide": prep.name,
         "slide_path": str(prep.slide_path),
         "encoder": "virchow",
         "encoder_source": HF_HUB_ID,
@@ -56,9 +57,9 @@ def slide_metadata(prep: "PreparedSlide") -> dict[str, str | int | float | np.nd
         # files are the ones written before this attribute existed
         "feature_dtype": np.dtype(FEATURE_DTYPE).name,
         "mpp": float(prep.mpp) if prep.mpp else float("nan"),
-        # "header" for the Aperio MPP field, otherwise the AppMag it was inferred
-        # from -- the handful of slides with a truncated header are worth being
-        # able to find again in the output
+        # "header" for the Aperio MPP field, "PixelSpacing" for a DICOM slide,
+        # otherwise the AppMag it was inferred from -- the handful of slides
+        # with a truncated header are worth being able to find again
         "mpp_source": prep.mpp_source,
         "slide_dimensions": np.asarray(prep.dimensions, dtype=np.int64),
         # the full (n_cols, n_rows) tile grid, before tissue filtering
@@ -66,6 +67,8 @@ def slide_metadata(prep: "PreparedSlide") -> dict[str, str | int | float | np.nd
         "thumbnail": prep.thumbnail_path.name,
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "torch_version": str(torch.__version__),
+        # DICOM slides only: the header's PatientID, which aggregate groups by
+        **({"case_id": prep.case_id} if prep.case_id else {}),
     }
 
 
@@ -135,6 +138,7 @@ class PreparedSlide:
     """
 
     slide_path: Path
+    name: str
     thumbnail_path: Path
     out_path: Path
     n_tiles: int
@@ -142,6 +146,7 @@ class PreparedSlide:
     mpp_source: str
     dimensions: tuple[int, int]
     extract_px: int
+    case_id: str | None
     batches: Iterator  # live DataLoader iterator, already filling
     # what the setup cost on the prefetch thread. Scalars, like everything else
     # here -- see the class docstring on why this holds no Slide
@@ -193,15 +198,15 @@ def prepare_slide(
         n_tiles = len(masked_coords)
         logger.info(
             "%s: %s px, %.4f mpp, %d tiles after QC",
-            slide_path.name,
+            slide.name,
             "x".join(str(d) for d in slide.dimensions),
             slide.mpp,
             n_tiles,
         )
-        if slide.mpp_source != "header":
+        if slide.mpp_source.startswith("AppMag"):
             logger.warning(
                 "%s: no MPP in the Aperio header, inferred %.4f from %s",
-                slide_path.name,
+                slide.name,
                 slide.mpp,
                 slide.mpp_source,
             )
@@ -213,7 +218,7 @@ def prepare_slide(
         # slide has no tissue, and it is the one artefact worth keeping
         if n_tiles == 0:
             raise NoTissueError(
-                f"{slide_path.name}: tissue detection kept no tiles"
+                f"{slide.name}: tissue detection kept no tiles"
                 f" (components >= {MIN_TISSUE_AREA_MM2:.3f} mm^2, tiles >="
                 f" {MIN_TILE_OCCUPANCY:.0%} tissue);"
                 f" see {thumbnail_path.name}"
@@ -224,6 +229,7 @@ def prepare_slide(
 
         prep = PreparedSlide(
             slide_path=slide_path,
+            name=slide.name,
             thumbnail_path=thumbnail_path,
             out_path=out_path,
             n_tiles=n_tiles,
@@ -231,6 +237,7 @@ def prepare_slide(
             mpp_source=slide.mpp_source,
             dimensions=slide.dimensions,
             extract_px=slide.extract_px,
+            case_id=slide.case_id,
             # last, so nothing above can fail with readers already in flight
             batches=iter(tile_dl),
         )
@@ -270,7 +277,7 @@ def embed_slide(
     t_wait = t_gpu = t_h5 = 0.0
     t_fill = None
     n_batches = 0
-    slide_path, out_path = prep.slide_path, prep.out_path
+    name, out_path = prep.name, prep.out_path
     n_tiles = prep.n_tiles
 
     # write to a temp file so a crashed run never leaves a plausible-looking .h5
@@ -284,7 +291,7 @@ def embed_slide(
             ) as h5,
             tqdm(
                 total=n_tiles,
-                desc=slide_path.name,
+                desc=name,
                 unit="tile",
                 leave=False,
                 position=1,
@@ -360,7 +367,7 @@ def embed_slide(
     logger.info(
         "%s -> %s: %d tiles in %.1fs (%.0f tiles/s) "
         "[wait %.1fs fill %.1fs gpu %.1fs h5 %.1fs]",
-        slide_path.name,
+        name,
         out_path.name,
         n_tiles,
         elapsed,

@@ -11,6 +11,7 @@
 h5py                    # per-slide HDF5 output
 imagecodecs             # tifffile's JPEG / JPEG 2000 decoders for Aperio segments
 opencv-python-headless  # tissue detection, tile resize, thumbnail encode
+pydicom                 # DICOM WSI headers: which file is which level, pixel spacing
 rich                    # colorized logging
 tifffile                # reads the Aperio pyramid directly, see _reader.py
 timm                    # Virchow is a timm model: hf-hub:paige-ai/Virchow

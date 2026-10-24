@@ -1,4 +1,4 @@
-"""Tile SVS slides and embed every tile with Virchow, one HDF5 per slide.
+"""Tile SVS or DICOM slides and embed every tile with Virchow, one HDF5 per slide.
 
 Slides are tiled by `_reader.Slide` -- tifffile straight onto the Aperio pyramid, with
 darkness-Otsu tissue detection and occupancy-based tiling -- at 224 px / 20x, and
@@ -36,6 +36,7 @@ what keeps the resume-by-skipping-existing-.h5 behaviour working across all of t
 import sys
 import time
 from argparse import ArgumentParser
+from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
@@ -48,10 +49,11 @@ from ._dataset import TileDataset
 from ._logging import StatsLog, progress_disabled, setup_logging
 from ._model import TARGET_MPP, TILE_PX, WrappedVirchow
 from ._pipeline import compile_model, embed_slide, prepare_slide
-from ._reader import NoTissueError, UnsupportedSlideError
+from ._reader import NoTissueError, SlideRef, UnsupportedSlideError, find_slides
 from ._sysmon import SysMonitor
 
-SLIDE_EXTS = [".svs"]
+# .dcm finds DICOM whole-slide series, one slide per series directory
+SLIDE_EXTS = [".svs", ".dcm"]
 # one pool feeds the GPU while the other fills for the next slide
 N_READER_POOLS = 2
 
@@ -117,22 +119,23 @@ def main(args):
     logger = setup_logging()
 
     exts = {e.lower() if e.startswith(".") else f".{e.lower()}" for e in args.exts}
-    slide_paths = sorted(
-        p
-        for p in args.slide_dir.rglob("*")
-        if p.is_file()
-        and p.suffix.lower() in exts
-        and not any(x in p.name for x in EXCLUDED_SLIDES)
-    )
+    slides = find_slides(args.slide_dir, exts)
+    slides = [s for s in slides if not any(x in s.name for x in EXCLUDED_SLIDES)]
+    # two slides with one name would write one .h5, and the second would then be
+    # skipped as already embedded; refuse before either happens
+    dupes = sorted(n for n, c in Counter(s.name for s in slides).items() if c > 1)
+    if dupes:
+        logger.error("%d slide names are not unique: %s", len(dupes), ", ".join(dupes))
+        return 1
     # Shard before anything else, so each GPU's process sees only its own slides
     # and the two of them never race to write the same .h5. A plain stride is
     # enough: over 11.6k slides it lands within 1% of a tile-count-balanced
     # split, so there is nothing to gain from predicting per-slide cost.
     if args.shards > 1:
-        slide_paths = slide_paths[args.shard :: args.shards]
-    n_slides = len(slide_paths)
+        slides = slides[args.shard :: args.shards]
+    n_slides = len(slides)
 
-    if not slide_paths:
+    if not slides:
         logger.error("no slides matching %s under %s", args.exts, args.slide_dir)
         return 1
     embed_dir = args.out_dir / "embeddings"
@@ -152,13 +155,13 @@ def main(args):
 
     # resolve skips up front: the prefetch below runs one slide ahead, and it can
     # only do that against a list of slides it is actually going to embed
-    todo = []
-    for slide_path in slide_paths:
-        out_path = embed_dir / f"{slide_path.stem}.h5"
+    todo: list[SlideRef] = []
+    for slide in slides:
+        out_path = embed_dir / f"{slide.name}.h5"
         if out_path.exists() and not args.overwrite:
             logger.info("%s exists, skipping", out_path.name)
             continue
-        todo.append(slide_path)
+        todo.append(slide)
     if not todo:
         logger.info("nothing to do: all %d slides already embedded", n_slides)
         return 0
@@ -172,7 +175,7 @@ def main(args):
         )
     pools = [
         make_reader_pool(
-            slide_paths=todo,
+            slide_paths=[s.path for s in todo],
             batch_size=args.batch_size,
             num_tile_readers=args.num_tile_readers,
             prefetch_factor=args.prefetch_factor,
@@ -207,10 +210,10 @@ def main(args):
         return prep_pool.submit(
             prepare_slide,
             logger=logger,
-            slide_path=todo[i],
-            thumbnail_path=thumb_dir / f"{todo[i].stem}.png",
+            slide_path=todo[i].path,
+            thumbnail_path=thumb_dir / f"{todo[i].name}.png",
             thumbnail_width=args.thumbnail_width,
-            out_path=embed_dir / f"{todo[i].stem}.h5",
+            out_path=embed_dir / f"{todo[i].name}.h5",
             tile_ds=tile_ds,
             tile_dl=tile_dl,
         )
@@ -223,8 +226,9 @@ def main(args):
     stats_path = args.out_dir / "stats.jsonl"
     logger.info("per-slide stats -> %s", stats_path)
     try:
-        with StatsLog(stats_path) as stats, SysMonitor(
-            stats=stats, interval=args.sysmon_interval
+        with (
+            StatsLog(stats_path) as stats,
+            SysMonitor(stats=stats, interval=args.sysmon_interval),
         ):
             stats.write(
                 kind="run",
@@ -241,7 +245,7 @@ def main(args):
                 pools=N_READER_POOLS,
             )
             pending = submit(0)
-            for i, slide_path in enumerate(
+            for i, (_, slide_name) in enumerate(
                 tqdm(
                     todo,
                     desc="slides",
@@ -250,7 +254,7 @@ def main(args):
                     disable=progress_disabled(),
                 )
             ):
-                logger.info("[%d/%d] %s", i + 1, len(todo), slide_path.name)
+                logger.info("[%d/%d] %s", i + 1, len(todo), slide_name)
                 # queue the next slide *before* blocking on this one, so its setup
                 # and pipeline fill overlap this slide's GPU time
                 this, pending = pending, submit(i + 1)
@@ -259,12 +263,12 @@ def main(args):
                 try:
                     prep = this.result()
                 except (UnsupportedSlideError, NoTissueError) as exc:
-                    logger.warning("rejected %s: %s", slide_path.name, exc)
-                    rejected.append(slide_path.name)
+                    logger.warning("rejected %s: %s", slide_name, exc)
+                    rejected.append(slide_name)
                     stats.write(
                         kind="slide",
                         t=time.time(),
-                        slide=slide_path.name,
+                        slide=slide_name,
                         index=i,
                         stage="prepare",
                         ok=False,
@@ -273,12 +277,12 @@ def main(args):
                     )
                     continue
                 except Exception:
-                    logger.exception("failed to prepare %s", slide_path.name)
-                    failed.append(slide_path.name)
+                    logger.exception("failed to prepare %s", slide_name)
+                    failed.append(slide_name)
                     stats.write(
                         kind="slide",
                         t=time.time(),
-                        slide=slide_path.name,
+                        slide=slide_name,
                         index=i,
                         stage="prepare",
                         ok=False,
@@ -294,12 +298,12 @@ def main(args):
                         device=device,
                     )
                 except Exception:
-                    logger.exception("failed to embed %s", slide_path.name)
-                    failed.append(slide_path.name)
+                    logger.exception("failed to embed %s", slide_name)
+                    failed.append(slide_name)
                     stats.write(
                         kind="slide",
                         t=time.time(),
-                        slide=slide_path.name,
+                        slide=slide_name,
                         index=i,
                         stage="embed",
                         ok=False,
@@ -313,7 +317,7 @@ def main(args):
                 stats.write(
                     kind="slide",
                     t=time.time(),
-                    slide=slide_path.name,
+                    slide=slide_name,
                     index=i,
                     ok=True,
                     pool=i % N_READER_POOLS,
@@ -362,7 +366,8 @@ if __name__ == "__main__":
         "--exts",
         nargs="+",
         default=SLIDE_EXTS,
-        help="slide extensions to look for",
+        help="slide extensions to look for; .dcm finds DICOM whole-slide series,"
+        " one slide per series directory",
     )
     p.add_argument(
         "--batch-size",

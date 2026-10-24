@@ -14,8 +14,8 @@ embeddings from pathology, transcriptomics and language foundation models. Three
 
 | path | what it is |
 | --- | --- |
-| [notebooks/](./notebooks) | GDC API queries that build the download manifests |
-| [manifests/](./manifests) | the manifests those notebooks emit, fed to `gdc-client` |
+| [notebooks/](./notebooks) | GDC API and IDC index queries that build the download manifests |
+| [manifests/](./manifests) | the manifests those notebooks emit, fed to `gdc-client` or `idc` |
 | [embed/virchow/](./embed/virchow) | WSI → per-tile Virchow embeddings; our own, very fast WSI tiling for TCGA slides; the production embedding pipeline |
 | [embed/gemma/](./embed/gemma) | pathology reports → Gemma 4 summaries → EmbeddingGemma 2 embeddings |
 | [embed/bulkformer/](./embed/bulkformer) | RNA-seq → Bulkformer embeddings — **placeholder, not yet written** |
@@ -52,6 +52,40 @@ API directly.
 
 3. **Extract and cleanup.** `gdc-client` writes one directory per file UUID. Embedding code should traverse the nested download structure.
 
+### CPTAC slides
+
+The CPTAC pathology is not on the GDC; it is DICOM in the
+[Imaging Data Commons](https://portal.imaging.datacommons.cancer.gov/) (IDC), and downloads go
+through its [`idc-index`](https://github.com/ImagingDataCommons/idc-index) client (MIT, in
+`requirements.txt`) and the `idc` command it installs. The chain is the same shape as the GDC one.
+
+1. **Build a manifest.**
+   [cptac-primary-tumor-slide-manifest.ipynb](./notebooks/cptac-primary-tumor-slide-manifest.ipynb)
+   queries the IDC index for H&E slides whose specimen is coded `Neoplasm, Primary`. Slides coded
+   normal and slides with no tissue type are left out, and so are the CT/PET/MR series in the same
+   collections. The notebook writes
+   [cptac-primary-tumor-slide.s5cmd](./manifests/cptac-primary-tumor-slide.s5cmd), with one
+   `cp s3://...` line per slide series, plus a metadata table that maps each slide name
+   (`ContainerIdentifier`) to its case. For CPTAC-LUAD and CPTAC-LSCC that is 1,343 slides
+   (681 + 662) across 432 patients, ~618 GB. The manifest's first line records the IDC data
+   release it was built against.
+
+2. **Download.**
+
+    ```bash
+    idc download-from-manifest \
+      --manifest-file manifests/cptac-primary-tumor-slide.s5cmd \
+      --download-dir /path/to/save/data \
+      --use-s5cmd-sync True
+    ```
+
+    The files come from IDC's public buckets, so no credentials are needed. The layout is
+    `<collection>/<patient>/<study UID>/SM_<series UID>/*.dcm`, one directory per slide holding
+    its pyramid levels, label, overview and thumbnail. `--use-s5cmd-sync` makes a rerun against
+    the same `--download-dir` fetch only what is missing.
+
+`embed/virchow` reads that directory as it is. It treats each DICOM series as one slide.
+
 ## Embedding
 
 [compose.yaml](./compose.yaml) at the repo root builds every embedding image under the tag its
@@ -63,8 +97,8 @@ HF_TOKEN=hf_xxx docker compose build   # or append a service: virchow, gemma
 
 ### `embed/virchow` — whole-slide images
 
-A self-contained container that walks a directory of `.svs` slides and writes, per slide, an `.h5`
-of per-tile Virchow embeddings plus a masked thumbnail. Slides are read straight off the Aperio
+A self-contained container that walks a directory of `.svs` slides (or CPTAC's DICOM series) and
+writes, per slide, an `.h5` of per-tile Virchow embeddings plus a masked thumbnail. Slides are read straight off the Aperio
 pyramid with `tifffile`, tissue is detected CLAM-style, and 224 px tiles at 20x are streamed to a
 `torch.compile`d Virchow. It sustains ~1200 tiles/s on one H200 — roughly 35 h for the whole TCGA
 diagnostic corpus on a single GPU. A second, GPU-free step collects each slide's mean embedding

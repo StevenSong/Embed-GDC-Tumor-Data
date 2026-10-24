@@ -2,6 +2,7 @@ black
 detect-secrets
 h5py
 h5tree
+idc-index
 imagecodecs
 ipywidgets
 isort
