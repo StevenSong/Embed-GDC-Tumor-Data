@@ -4,6 +4,9 @@
 #   HF_TOKEN=hf_xxx docker compose build   # all images
 #   docker compose build gemma             # just one
 #
+# ctds-rnaseq bakes in weights from CTDS_RNASEQ_WEIGHTS, an omics-encoder
+# checkout (the repo root, not kserve-demo/), by default external/omics-encoder.
+#
 # HF_TOKEN is only needed for virchow (paige-ai/Virchow is gated); it is passed as
 # a BuildKit secret, never a build arg, so it stays out of the image history.
 
@@ -19,6 +22,14 @@ services:
     image: gemma-embedder:latest
     build:
       context: embed/gemma
+
+  ctds-rnaseq:
+    image: ctds-rnaseq-embedder:latest
+    build:
+      context: embed/ctds-rnaseq
+      additional_contexts:
+        # weights are baked in from here, never committed; see embed/ctds-rnaseq/README.md
+        weights: ${CTDS_RNASEQ_WEIGHTS:-external/omics-encoder}
 
 secrets:
   hf_token:

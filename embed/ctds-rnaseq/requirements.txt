@@ -1,0 +1,11 @@
+# Direct dependencies of the embedder package.
+#
+# torch is pinned, as in embed/virchow, because the CUDA build matters and the
+# default PyPI wheels are built against CUDA 13.0. For a different CUDA build,
+# install torch from https://download.pytorch.org/whl/cuXXX before this file.
+
+h5py                    # embedding output, one dataset per sample
+numpy
+pandas                  # STAR-counts TSVs, manifest and metadata tables
+torch==2.13.0
+tqdm                    # progress bars when run interactively
