@@ -33,6 +33,7 @@ import hashlib
 import logging
 import os
 import sys
+import time
 from argparse import ArgumentParser
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -50,6 +51,37 @@ from ._logging import progress_disabled, setup_logging
 from ._sample_io import TPM_COLUMN, load_genes, read_tpm
 
 TSV_SUFFIX = ".rna_seq.augmented_star_gene_counts.tsv"
+N_PROGRESS_LINES = 20  # per phase, in place of a progress bar when there is none
+
+
+class Progress:
+    """Log `done/total` about N_PROGRESS_LINES times, only when tqdm is disabled.
+
+    A slurm log gets no progress bar (see _logging), and without this it is silent
+    from model load until the file is written.
+    """
+
+    def __init__(self, logger: logging.Logger, what: str, total: int):
+        self.logger, self.what, self.total = logger, what, total
+        self.every = max(1, total // N_PROGRESS_LINES)
+        self.next = self.every  # a threshold, not a modulus: batches step past it
+        self.enabled = progress_disabled()
+        self.start = time.monotonic()
+
+    def update(self, done: int):
+        if not self.enabled or (done < self.next and done != self.total):
+            return
+        self.next = (done // self.every + 1) * self.every
+        elapsed = time.monotonic() - self.start
+        eta = elapsed / done * (self.total - done)
+        self.logger.info(
+            "%s %d/%d (%.0fs elapsed, ~%.0fs left)",
+            self.what,
+            done,
+            self.total,
+            elapsed,
+            eta,
+        )
 
 
 @dataclass
@@ -149,6 +181,7 @@ def read_samples(
     """(N, G) float32 TPM, NaN = absent, and per-sample stats; None if any file is bad."""
     tpm = np.empty((len(samples), len(genes)), dtype=np.float32)
     stats, bad = [], 0
+    progress = Progress(logger, "read", len(samples))
     with ProcessPoolExecutor(
         num_workers, initializer=_init_worker, initargs=(genes,)
     ) as pool:
@@ -161,6 +194,7 @@ def read_samples(
                 disable=progress_disabled(),
             )
         ):
+            progress.update(i + 1)
             if x is None:
                 logger.error("%s/%s: %s", s.file_id, s.path.name, st)
                 bad += 1
@@ -175,7 +209,11 @@ def read_samples(
 
 @torch.inference_mode()
 def embed_tpm(
-    encoder: _model.Encoder, tpm: np.ndarray, batch_size: int, device: torch.device
+    logger: logging.Logger,
+    encoder: _model.Encoder,
+    tpm: np.ndarray,
+    batch_size: int,
+    device: torch.device,
 ) -> np.ndarray:
     # Only the fused kernels attend over ~20k positions in bounded memory; pinning
     # them turns a silent fallback to the math kernel (G x G scores per head, OOM at
@@ -184,6 +222,7 @@ def embed_tpm(
     if device.type == "cpu":
         backends += [SDPBackend.FLASH_ATTENTION, SDPBackend.MATH]
     out = []
+    progress = Progress(logger, "embedded", len(tpm))
     with sdpa_kernel(backends):
         for start in tqdm(
             range(0, len(tpm), batch_size),
@@ -193,6 +232,7 @@ def embed_tpm(
         ):
             x = torch.from_numpy(tpm[start : start + batch_size]).to(device)
             out.append(encoder(x).cpu().numpy())
+            progress.update(min(start + batch_size, len(tpm)))
     return np.concatenate(out)
 
 
@@ -246,7 +286,7 @@ def embed(
 
     encoder = _model.load_encoder(weights_dir, len(genes)).to(device)
     logger.info("loaded %s on %s", weights_dir, device)
-    emb = embed_tpm(encoder, tpm, batch_size, device)
+    emb = embed_tpm(logger, encoder, tpm, batch_size, device)
     if not np.isfinite(emb).all():
         bad = [s.name for s, ok in zip(samples, np.isfinite(emb).all(1)) if not ok]
         logger.error("non-finite embeddings for %s; nothing written", ", ".join(bad))
