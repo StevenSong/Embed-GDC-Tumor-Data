@@ -230,4 +230,6 @@ temp.*
 temp/
 .devcontainer/
 m3ai-demos/
+m3-data/
 multimodal-cancer-modeling/
+omics-encoder/
